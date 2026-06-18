@@ -16,11 +16,12 @@ import csv
 import io
 import json
 import os
+import re
 import time
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 import httpx
 from fastmcp import FastMCP
@@ -350,9 +351,22 @@ _MISSING_CHECKS = {
     "authors": lambda m: not _author_names(m),
     "description": lambda m: not m.get("description"),
     "isbn": lambda m: not (m.get("isbn10") or m.get("isbn13")),
+    "isbn10": lambda m: not m.get("isbn10"),
+    "isbn13": lambda m: not m.get("isbn13"),
     "series": lambda m: not m.get("seriesName"),
     "cover": lambda m: not m.get("coverUpdatedOn"),
+    "asin": lambda m: not m.get("asin"),
+    "goodreadsId": lambda m: not m.get("goodreadsId"),
+    "googleId": lambda m: not m.get("googleId"),
+    "hardcoverId": lambda m: not m.get("hardcoverId"),
+    "amazonRating": lambda m: not m.get("amazonRating"),
+    "goodreadsRating": lambda m: not m.get("goodreadsRating"),
+    "publisher": lambda m: not m.get("publisher"),
+    "language": lambda m: not m.get("language"),
+    "pageCount": lambda m: not m.get("pageCount"),
 }
+# Of the missing-checks, those whose field BookLore strips from the plain list response.
+_MISSING_FULL_ONLY = {"asin", "goodreadsId", "googleId", "hardcoverId", "description"}
 
 _SORT_KEYS = {
     "title": lambda b: (b.get("title") or (b.get("metadata") or {}).get("title") or "").lower(),
@@ -409,11 +423,16 @@ def _matches_filters(book: dict, filters: dict) -> bool:
     if (libs := filters.get("library_ids")) and book.get("libraryId") not in set(libs):
         return False
 
-    # `missing`: keep only books for which *every* listed field is empty.
-    for field in filters.get("missing") or []:
-        check = _MISSING_CHECKS.get(field)
-        if check and not check(meta):
-            return False
+    # `missing`: filter on empty fields. mode "all" (default) keeps a book only when every
+    # listed field is empty; mode "any" keeps it when at least one listed field is empty.
+    if missing := filters.get("missing"):
+        flags = [_MISSING_CHECKS[f](meta) for f in missing if f in _MISSING_CHECKS]
+        if flags:
+            if filters.get("missing_mode") == "any":
+                if not any(flags):
+                    return False
+            elif not all(flags):
+                return False
 
     return True
 
@@ -430,30 +449,205 @@ def _merge_list(current: list | None, add: list | None = None, remove: list | No
     return result
 
 
+# MetadataProvider enum name -> key under settings.metadataProviderSettings. Mostly a
+# lowercased first letter, but GoodReads/Lubimyczytac don't follow that, so map explicitly.
+_PROVIDER_SETTINGS_KEY = {
+    "Amazon": "amazon",
+    "Google": "google",
+    "GoodReads": "goodReads",
+    "Hardcover": "hardcover",
+    "Comicvine": "comicvine",
+    "Douban": "douban",
+    "Lubimyczytac": "lubimyczytac",
+    "Ranobedb": "ranobedb",
+    "Audible": "audible",
+}
+
+# Fields BookLore's clearFlags map accepts on PUT .../metadata. Setting a flag true nulls
+# that field regardless of replaceMode — the only way to clear ONE field without
+# REPLACE_ALL wiping the whole record. (From the backend's MetadataClearFlags class.)
+_CLEARABLE_FIELDS = {
+    "title",
+    "subtitle",
+    "publisher",
+    "publishedDate",
+    "description",
+    "seriesName",
+    "seriesNumber",
+    "seriesTotal",
+    "isbn13",
+    "isbn10",
+    "asin",
+    "goodreadsId",
+    "comicvineId",
+    "hardcoverId",
+    "hardcoverBookId",
+    "googleId",
+    "pageCount",
+    "language",
+    "amazonRating",
+    "amazonReviewCount",
+    "goodreadsRating",
+    "goodreadsReviewCount",
+    "hardcoverRating",
+    "hardcoverReviewCount",
+    "lubimyczytacId",
+    "lubimyczytacRating",
+    "ranobedbId",
+    "ranobedbRating",
+    "audibleId",
+    "audibleRating",
+    "audibleReviewCount",
+    "authors",
+    "categories",
+    "moods",
+    "tags",
+    "cover",
+    "reviews",
+    "narrator",
+    "abridged",
+    "ageRating",
+    "contentRating",
+}
+
+# Goodreads ids arrive both bare ("171712768") and slugged
+# ("23463279-designing-data-intensive-applications"); BookLore stores either verbatim.
+_GOODREADS_ID_RE = re.compile(r"^\s*(\d+)(?:-.*)?\s*$")
+
+
+def _normalize_goodreads_id(value: Any) -> Any:
+    """Reduce a Goodreads id to its bare numeric form, leaving non-numeric values as-is."""
+    if not isinstance(value, str):
+        return value
+    m = _GOODREADS_ID_RE.match(value)
+    return m.group(1) if m else value.strip()
+
+
+def _normalize_metadata(meta: dict) -> dict:
+    """Copy of a metadata patch with identifier fields normalized on write."""
+    out = dict(meta)
+    if out.get("goodreadsId") is not None:
+        out["goodreadsId"] = _normalize_goodreads_id(out["goodreadsId"])
+    return out
+
+
+# Provider enum name -> its provider-specific field toggles under
+# settings.metadataProviderSpecificFields. These gate whether a field is *persisted* on
+# auto-fetch/refresh; a disabled toggle leaves that field empty library-wide even when the
+# provider runs (e.g. goodreadsRating off => no book ever gets a Goodreads rating).
+_PROVIDER_SPECIFIC_FIELDS = {
+    "Amazon": ["asin", "amazonRating", "amazonReviewCount"],
+    "Google": ["googleId"],
+    "GoodReads": ["goodreadsId", "goodreadsRating", "goodreadsReviewCount"],
+    "Hardcover": ["hardcoverId", "hardcoverBookId", "hardcoverRating", "hardcoverReviewCount"],
+    "Comicvine": ["comicvineId"],
+    "Lubimyczytac": ["lubimyczytacId", "lubimyczytacRating"],
+    "Ranobedb": ["ranobedbId", "ranobedbRating"],
+    "Audible": ["audibleId", "audibleRating", "audibleReviewCount"],
+    "Douban": [],
+}
+
+
+async def _app_settings() -> dict | None:
+    """Best-effort read of the full app settings (provider enablement, Amazon cookie,
+    provider-specific field toggles). Returns None when the endpoint is unavailable
+    (e.g. permission denied), so callers degrade to result-only status rather than fail."""
+    with suppress(BookLoreError):
+        settings = await client.get("/api/v1/settings")
+        if isinstance(settings, dict):
+            return settings
+    return None
+
+
+def _meta(book: dict) -> dict:
+    return book.get("metadata") or {}
+
+
+def _shelf_names(book: dict) -> list[str]:
+    return [s["name"] for s in (book.get("shelves") or []) if isinstance(s, dict) and s.get("name")]
+
+
+# Flat field extractors for export_library's `fields` projection. Fields beyond the plain
+# list view (asin, goodreadsId, googleId, hardcoverId, subtitle, description) are stripped
+# by BookLore's list endpoint, so selecting them forces a withDescription fetch.
+_EXPORT_FIELDS: dict[str, Any] = {
+    "id": lambda b: b.get("id"),
+    "title": lambda b: b.get("title") or _meta(b).get("title"),
+    "subtitle": lambda b: _meta(b).get("subtitle"),
+    "authors": lambda b: _author_names(_meta(b)),
+    "series": lambda b: _meta(b).get("seriesName"),
+    "seriesNumber": lambda b: _meta(b).get("seriesNumber"),
+    "publisher": lambda b: _meta(b).get("publisher"),
+    "publishedDate": lambda b: _meta(b).get("publishedDate"),
+    "language": lambda b: _meta(b).get("language"),
+    "pageCount": lambda b: _meta(b).get("pageCount"),
+    "isbn10": lambda b: _meta(b).get("isbn10"),
+    "isbn13": lambda b: _meta(b).get("isbn13"),
+    "asin": lambda b: _meta(b).get("asin"),
+    "goodreadsId": lambda b: _meta(b).get("goodreadsId"),
+    "googleId": lambda b: _meta(b).get("googleId"),
+    "hardcoverId": lambda b: _meta(b).get("hardcoverId"),
+    "amazonRating": lambda b: _meta(b).get("amazonRating"),
+    "goodreadsRating": lambda b: _meta(b).get("goodreadsRating"),
+    "personalRating": lambda b: b.get("personalRating"),
+    "readStatus": lambda b: b.get("readStatus"),
+    "tags": lambda b: list(_meta(b).get("tags") or []),
+    "categories": lambda b: list(_meta(b).get("categories") or []),
+    "description": lambda b: _meta(b).get("description"),
+    "shelves": _shelf_names,
+}
+
+# Export/missing fields BookLore omits from the plain list response (need withDescription).
+_FULL_ONLY_FIELDS = {"asin", "goodreadsId", "googleId", "hardcoverId", "subtitle", "description"}
+
+
 async def _all_books(with_description: bool = False) -> list[dict]:
     return await client.get_books(with_description)
 
 
-async def _put_metadata(book_id: int, meta_patch: dict) -> Any:
+async def _put_metadata(
+    book_id: int, meta_patch: dict, clear_fields: list[str] | None = None
+) -> Any:
     """PUT a partial metadata object, touching ONLY the supplied fields.
 
     Uses REPLACE_WHEN_PROVIDED: BookLore writes just the keys present in the
     payload and leaves every other field untouched. (REPLACE_ALL would null out
     every field we omit — title, authors, description, ISBNs — so it must never
     be used with a partial patch.) `clearFlags` must be present or the API 500s.
+
+    `clear_fields` are field names to null out: BookLore honours a true clearFlag
+    regardless of replace mode, so it's the one way to clear a single field without
+    REPLACE_ALL wiping the rest.
     """
+    clear_flags = {f: True for f in (clear_fields or [])}
     return await client.put(
         f"/api/v1/books/{book_id}/metadata",
         params={"mergeCategories": "false", "replaceMode": "REPLACE_WHEN_PROVIDED"},
-        json={"metadata": meta_patch, "clearFlags": {}},
+        json={"metadata": meta_patch, "clearFlags": clear_flags},
     )
 
 
-async def _apply_patch(book_id: int, patch: dict) -> dict:
-    """Apply an additive tags/categories patch to one book; return its fresh record.
+def _validate_clear_fields(clear_fields: list[str] | None) -> None:
+    """Reject clearFlag names BookLore won't accept, with a helpful message."""
+    bad = sorted(set(clear_fields or []) - _CLEARABLE_FIELDS)
+    if bad:
+        raise BookLoreError(
+            f"Cannot clear unknown field(s): {', '.join(bad)}. "
+            f"Clearable fields: {', '.join(sorted(_CLEARABLE_FIELDS))}."
+        )
 
-    `patch` is {"tags": {"add": [...], "remove": [...]}, "categories": {...}}.
+
+async def _apply_patch(book_id: int, patch: dict) -> dict:
+    """Apply a per-book patch to one book; return its fresh record.
+
+    `patch` keys:
+      - tags / categories: {"add": [...], "remove": [...]} — additive merges.
+      - metadata: {field: value, ...} — arbitrary BookMetadata fields written
+        with REPLACE_WHEN_PROVIDED (only the keys you pass; identifiers normalized).
+      - clear_fields: [field, ...] — fields to null out (see _put_metadata).
     """
+    clear_fields = patch.get("clear_fields") or []
+    _validate_clear_fields(clear_fields)
     book = await client.get(f"/api/v1/books/{book_id}", params={"withDescription": "false"})
     meta = book.get("metadata") or {}
     meta_patch: dict[str, Any] = {}
@@ -461,9 +655,11 @@ async def _apply_patch(book_id: int, patch: dict) -> dict:
         if field in patch:
             ops = patch[field] or {}
             meta_patch[field] = _merge_list(meta.get(field), ops.get("add"), ops.get("remove"))
-    if not meta_patch:
+    if extra := patch.get("metadata"):
+        meta_patch.update(_normalize_metadata(extra))
+    if not meta_patch and not clear_fields:
         return book
-    await _put_metadata(book_id, meta_patch)
+    await _put_metadata(book_id, meta_patch, clear_fields)
     return await client.get(f"/api/v1/books/{book_id}", params={"withDescription": "false"})
 
 
@@ -584,11 +780,12 @@ async def isbn_lookup(isbn: str) -> dict:
 @mcp.tool(annotations={"title": "Update book metadata"})
 async def update_book_metadata(
     book_id: int,
-    metadata: dict,
+    metadata: dict | None = None,
     replace_mode: Literal["REPLACE_WHEN_PROVIDED", "REPLACE_MISSING", "REPLACE_ALL"] = (
         "REPLACE_WHEN_PROVIDED"
     ),
     merge_categories: bool = False,
+    clear_fields: list[str] | None = None,
 ) -> dict:
     """Update a book's metadata. `metadata` is a BookMetadata object (e.g.
     {"title": ..., "authors": [...], "description": ..., "isbn13": ...}).
@@ -601,14 +798,21 @@ async def update_book_metadata(
     - REPLACE_ALL — replace the WHOLE record with what you send: any field you
       omit is wiped to null. Destructive — only use when you pass the full record.
 
-    `authors` is a list of name strings. Returns the full updated metadata record.
+    To CLEAR a field, list it in `clear_fields` (e.g. ["amazonRating"]). BookLore
+    nulls those fields regardless of replace_mode — under REPLACE_WHEN_PROVIDED a
+    `null` in `metadata` is ignored, so clear_fields is the way to empty one field
+    without REPLACE_ALL wiping the rest. `authors` is a list of name strings.
+    `goodreadsId` is normalized to its bare numeric id. Returns the updated record.
     """
+    _validate_clear_fields(clear_fields)
+    metadata = _normalize_metadata(metadata or {})
     # `clearFlags` must be present: the server's @Builder.Default isn't applied
     # on JSON deserialization, so omitting it leaves it null and the API 500s.
+    clear_flags = {f: True for f in (clear_fields or [])}
     return await client.put(
         f"/api/v1/books/{book_id}/metadata",
         params={"mergeCategories": str(merge_categories).lower(), "replaceMode": replace_mode},
-        json={"metadata": metadata, "clearFlags": {}},
+        json={"metadata": metadata, "clearFlags": clear_flags},
     )
 
 
@@ -730,12 +934,19 @@ async def search_books(
       - shelf_ids: [int], library_ids: [int]
       - read_status: "UNSET"|"READING"|"READ"|"UNREAD"|… (sparse upstream)
       - missing: subset of ["tags","categories","authors","description","isbn",
-        "series","cover"] — keeps only books where ALL listed fields are empty.
-        This is the "find everything still un-enriched" filter.
+        "isbn10","isbn13","series","cover","asin","goodreadsId","googleId",
+        "hardcoverId","amazonRating","goodreadsRating","publisher","language",
+        "pageCount"] — fields to treat as empty.
+      - missing_mode: "all" (default) keeps books where ALL listed fields are
+        empty; "any" keeps books missing AT LEAST ONE — better for enrichment
+        sweeps ("anything still lacking an id/rating").
     Returns {total, limit, offset, books:[summaries]}. `limit` is capped at 200.
     """
     filters = filters or {}
-    need_desc = "description" in (filters.get("missing") or [])
+    missing = filters.get("missing") or []
+    # Identifier fields (asin/goodreadsId/…) and description are stripped from the plain
+    # list response — fetch full metadata when the query depends on one of them.
+    need_desc = any(f in _MISSING_FULL_ONLY for f in missing)
     books = await _all_books(with_description=need_desc)
 
     if query:
@@ -812,38 +1023,77 @@ async def get_reading_stats() -> dict:
 
 @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Export library"})
 async def export_library(
-    format: Literal["json", "csv"] = "json", shelf_id: int | None = None
+    format: Literal["json", "csv"] = "json",
+    shelf_id: int | None = None,
+    fields: list[str] | None = None,
+    full: bool = False,
+    offset: int = 0,
+    limit: int | None = None,
 ) -> dict:
-    """Export the library (or one shelf) as JSON or CSV. Returns
-    {format, count, content} where `content` is the serialized text."""
+    """Export the library (or one shelf) as JSON or CSV.
+
+    By default returns the trimmed summary (id/title/authors/series/readStatus/
+    personalRating/shelves). To audit metadata completeness, pass `fields` to
+    project a specific set, or `full=True` for every field. Selectable fields:
+    id, title, subtitle, authors, series, seriesNumber, publisher, publishedDate,
+    language, pageCount, isbn10, isbn13, asin, goodreadsId, googleId, hardcoverId,
+    amazonRating, goodreadsRating, personalRating, readStatus, tags, categories,
+    description, shelves. Identifier fields (asin/goodreadsId/…) and description are
+    fetched on demand.
+
+    A full-library export easily exceeds the response token limit, so: prefer `csv`
+    (far more compact than JSON), keep `fields` narrow, and page with `offset`/`limit`
+    (the response reports `total` so you know how many pages remain). JSON output is
+    compact (no indentation). Returns {format, total, offset, limit, returned, fields,
+    content}.
+    """
+    if fields:
+        bad = sorted(set(fields) - set(_EXPORT_FIELDS))
+        if bad:
+            raise BookLoreError(
+                f"Unknown export field(s): {', '.join(bad)}. "
+                f"Available: {', '.join(_EXPORT_FIELDS)}."
+            )
+        cols = list(fields)
+    elif full:
+        cols = list(_EXPORT_FIELDS)
+    else:
+        cols = ["id", "title", "authors", "series", "readStatus", "personalRating", "shelves"]
+
+    need_desc = any(c in _FULL_ONLY_FIELDS for c in cols)
     if shelf_id is not None:
         books = await client.get(f"/api/v1/shelves/{shelf_id}/books") or []
+        if need_desc:  # shelf endpoint returns list-trimmed records; hydrate by id
+            full_by_id = {b.get("id"): b for b in await _all_books(with_description=True)}
+            books = [full_by_id.get(b.get("id"), b) for b in books]
     else:
-        books = await _all_books()
-    summaries = [_summarize_book(b) for b in books]
+        books = await _all_books(with_description=need_desc)
+
+    total = len(books)
+    offset = max(0, offset)
+    page = books[offset : offset + limit] if limit is not None else books[offset:]
+    rows = [{c: _EXPORT_FIELDS[c](b) for c in cols} for b in page]
 
     if format == "json":
-        content = json.dumps([s.model_dump() for s in summaries], ensure_ascii=False, indent=2)
+        content = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
     else:
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(
-            ["id", "title", "authors", "series", "readStatus", "personalRating", "shelves"]
-        )
-        for s in summaries:
+        writer.writerow(cols)
+        for row in rows:
             writer.writerow(
-                [
-                    s.id,
-                    s.title,
-                    "; ".join(s.authors or []),
-                    s.series,
-                    s.readStatus,
-                    s.personalRating,
-                    "; ".join(s.shelves),
-                ]
+                ["; ".join(str(x) for x in v) if isinstance(v, list) else v for v in row.values()]
             )
         content = buf.getvalue()
-    return {"format": format, "count": len(summaries), "content": content}
+    return {
+        "format": format,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "returned": len(rows),
+        "fields": cols,
+        "content": content,
+    }
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True, "title": "Ping / whoami"})
@@ -890,13 +1140,18 @@ async def bulk_update_metadata(
     patch: dict | None = None,
     items: list[dict] | None = None,
 ) -> dict:
-    """Apply additive tag/category patches to many books in one call.
+    """Apply per-book metadata patches to many books in one call.
 
     Either pass `book_ids` + a single `patch` (applied to all), or `items`
-    (`[{"book_id": int, "patch": {...}}]`) for per-book patches — not both. A
-    `patch` is {"tags": {"add": [...], "remove": [...]}, "categories": {...}}.
-    Partial success is reported per book; one bad id never fails the batch.
-    Returns {updated:[ids], failed:[{book_id,error}], books:[post-write records]}.
+    (`[{"book_id": int, "patch": {...}}]`) for per-book patches — not both.
+    A `patch` may combine:
+      - "tags"/"categories": {"add": [...], "remove": [...]} — additive merges.
+      - "metadata": {field: value, ...} — arbitrary BookMetadata fields (isbn13,
+        language, publisher, seriesName, …) written with REPLACE_WHEN_PROVIDED.
+      - "clear_fields": [field, ...] — fields to null out.
+    This covers bulk fills beyond tags/categories (e.g. ISBNs). For read status use
+    bulk_set_read_status. Partial success is reported per book; one bad id never
+    fails the batch. Returns {updated:[ids], failed:[{book_id,error}], books:[records]}.
     """
     if items and (book_ids or patch):
         raise BookLoreError("Pass either book_ids+patch OR items, not both.")
@@ -994,14 +1249,43 @@ async def fetch_metadata_candidates(
     NOT modify the book.
 
     `providers` is any of: Amazon, GoodReads, Google, Hardcover, Comicvine, Douban,
-    Lubimyczytac, Ranobedb, Audible (defaults to a few popular ones). `isbn`/`title`/
-    `author` optionally override the search terms. Returns the raw candidates from
-    each provider; review them, then apply a chosen one with update_book_metadata
-    (lock curated fields first with set_field_locks to protect them).
+    Lubimyczytac, Ranobedb, Audible (defaults to Google, GoodReads, Amazon). When you
+    pass none of `isbn`/`title`/`author`, the book's stored ISBN/title/author are used
+    as the query automatically — so book_id alone works.
+
+    Each candidate is a full BookMetadata object carrying that provider's own fields:
+    Amazon supplies asin/amazonRating, GoodReads supplies goodreadsId/goodreadsRating,
+    Google supplies googleId — so to fill a given field you must include the provider
+    that owns it. Review the candidates, then apply one with update_book_metadata
+    (lock curated fields first with set_field_locks).
+
+    `provider_status` reports each requested provider as ok (n candidates), empty (the
+    provider ran but returned nothing — blocked, rate-limited, mis-regioned, or no
+    match), or disabled (turned off in BookLore Settings > Metadata 1). This makes a dead
+    provider distinguishable from a genuine no-match, which the raw stream cannot. An entry
+    may also include `disabled_fields` — provider-specific fields (e.g. goodreadsRating)
+    toggled off in Settings > Metadata 2, which auto-fetch won't persist library-wide even
+    when the provider works.
     """
     provs = providers or ["Google", "GoodReads", "Amazon"]
+
+    # P1: default the search terms from the book's own stored metadata when the caller
+    # passes none — the backend otherwise falls back only to the filename, so book_id
+    # alone yields nothing useful.
+    query = {"isbn": isbn, "title": title, "author": author}
+    if not any(query.values()):
+        with suppress(BookLoreError):
+            book = await client.get(f"/api/v1/books/{book_id}", params={"withDescription": "false"})
+            meta = book.get("metadata") or {}
+            names = _author_names(meta)
+            query = {
+                "isbn": meta.get("isbn13") or meta.get("isbn10"),
+                "title": book.get("title") or meta.get("title"),
+                "author": names[0] if names else None,
+            }
+
     token = await client._ensure_token()
-    body = {"bookId": book_id, "providers": provs, "isbn": isbn, "title": title, "author": author}
+    body = {"bookId": book_id, "providers": provs, **query}
 
     candidates: list[dict] = []
     try:
@@ -1026,12 +1310,73 @@ async def fetch_metadata_candidates(
             f"Fetching candidates for book {book_id} timed out — external providers "
             f"can be slow. Try fewer providers or retry."
         ) from exc
+
+    # P0: derive per-provider status. The backend swallows provider errors (emits nothing
+    # for a failed provider), so we infer status from result counts, enriched with the
+    # provider config when readable (disabled provider, Amazon cookie, field toggles).
+    settings = await _app_settings()
+    queried = bool(query.get("isbn") or query.get("title"))
+    counts: Counter[str] = Counter(str(p) for c in candidates if (p := c.get("provider")))
+    provider_status = [_provider_status(p, counts.get(p, 0), settings, queried) for p in provs]
+
     return {
         "book_id": book_id,
+        "query": query,
         "providers": provs,
+        "provider_status": provider_status,
         "count": len(candidates),
         "candidates": candidates,
     }
+
+
+def _provider_status(provider: str, count: int, settings: dict | None, queried: bool) -> dict:
+    """Classify one requested provider's outcome as ok / empty / disabled, and note any of
+    its provider-specific fields (ratings/ids) that are toggled off — those stay empty
+    library-wide even when the provider returns candidates."""
+    prov_cfg = (settings or {}).get("metadataProviderSettings") or {}
+    field_cfg = (settings or {}).get("metadataProviderSpecificFields") or {}
+    cfg = prov_cfg.get(_PROVIDER_SETTINGS_KEY.get(provider, ""), {}) or {}
+
+    # Provider-specific fields explicitly disabled (only meaningful if we could read settings).
+    disabled_fields = (
+        [f for f in _PROVIDER_SPECIFIC_FIELDS.get(provider, []) if field_cfg.get(f) is False]
+        if settings is not None
+        else []
+    )
+
+    if settings is not None and _PROVIDER_SETTINGS_KEY.get(provider) and not cfg.get("enabled"):
+        result = {
+            "provider": provider,
+            "status": "disabled",
+            "count": 0,
+            "reason": "provider is disabled in BookLore Settings > Metadata 1.",
+        }
+    elif count:
+        result = {"provider": provider, "status": "ok", "count": count}
+    else:
+        # Enabled (or unknown) but produced nothing. A real query that still returns zero is
+        # far more likely a blocked/broken scraper than a true no-match.
+        if queried:
+            reason = (
+                "enabled but returned 0 candidates for a real query — likely blocked, "
+                "rate-limited, mis-regioned, or the provider's scraper is broken "
+                "server-side (the backend logs the error but the API does not expose it)."
+            )
+        else:
+            reason = (
+                "no candidates — no usable search terms (pass isbn/title or set them on the book)."
+            )
+        if provider == "Amazon" and not cfg.get("cookie"):
+            reason += " Amazon often needs a session cookie/region (Settings > Metadata 1)."
+        result = {"provider": provider, "status": "empty", "count": 0, "reason": reason}
+
+    if disabled_fields:
+        result["disabled_fields"] = disabled_fields
+        result["fields_note"] = (
+            f"these fields are toggled OFF in Settings > Metadata 2, so auto-fetch won't "
+            f"persist them library-wide: {', '.join(disabled_fields)}."
+        )
+    return result
 
 
 @mcp.tool(annotations={"idempotentHint": True, "title": "Add books to shelves"})
@@ -1052,6 +1397,148 @@ async def remove_from_shelves(book_ids: list[int], shelf_ids: list[int]) -> list
         "/api/v1/books/shelves",
         json={"bookIds": book_ids, "shelvesToAssign": [], "shelvesToUnassign": shelf_ids},
     )
+
+
+@mcp.tool(annotations={"idempotentHint": True, "title": "Bulk set read status"})
+async def bulk_set_read_status(items: list[dict]) -> dict:
+    """Set per-book reading status in bulk — e.g. importing a Goodreads CSV where each
+    book has its own status. `items` is [{"book_id": int, "status": ReadStatus}], with
+    status one of UNREAD/READING/RE_READING/READ/PARTIALLY_READ/PAUSED/WONT_READ/
+    ABANDONED/UNSET. Books are grouped by status and sent in ONE call per distinct
+    status (not one per book). Returns {updated, by_status:{status:count}, failed}.
+    """
+    valid = set(get_args(ReadStatus))
+    groups: dict[str, list[int]] = {}
+    failed: list[dict] = []
+    for entry in items:
+        bid = entry.get("book_id")
+        status = entry.get("status")
+        if not isinstance(bid, int) or not isinstance(status, str) or status not in valid:
+            failed.append({"book_id": bid, "error": f"invalid book_id/status: {entry}"})
+            continue
+        groups.setdefault(status, []).append(bid)
+
+    updated: list[int] = []
+    by_status: dict[str, int] = {}
+    for status, ids in groups.items():
+        await client.post("/api/v1/books/status", json={"bookIds": ids, "status": status})
+        updated.extend(ids)
+        by_status[status] = len(ids)
+    return {"updated": updated, "by_status": by_status, "failed": failed}
+
+
+# Duplicate-detection signal presets (BookLore exposes no presets server-side).
+_DUP_SIGNALS = (
+    "matchByIsbn",
+    "matchByExternalId",
+    "matchByTitleAuthor",
+    "matchByDirectory",
+    "matchByFilename",
+)
+_DUP_PRESETS = {
+    "strict": {"matchByIsbn", "matchByExternalId"},
+    "balanced": {"matchByIsbn", "matchByExternalId", "matchByTitleAuthor"},
+    "aggressive": set(_DUP_SIGNALS),
+}
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "title": "Find duplicates"})
+async def find_duplicates(
+    library_id: int | None = None,
+    preset: Literal["strict", "balanced", "aggressive"] = "balanced",
+    signals: dict | None = None,
+) -> dict:
+    """Find duplicate books using BookLore's native detection — read-only, merges nothing.
+
+    Detection is per-library; omit `library_id` to scan every library. `preset` picks
+    the signal set: strict (ISBN + external id), balanced (+ title/author), aggressive
+    (+ same-directory + filename). `signals` overrides individual flags, e.g.
+    {"matchByFilename": true}. Each group reports the suggested merge target, the match
+    reason, the books, and `distinct_isbns` (true ⇒ the books carry different ISBNs, so
+    likely separate editions rather than true duplicates).
+    Returns {libraries_scanned, group_count, groups}.
+    """
+    flags = {s: (s in _DUP_PRESETS[preset]) for s in _DUP_SIGNALS}
+    if signals:
+        bad = sorted(set(signals) - set(_DUP_SIGNALS))
+        if bad:
+            raise BookLoreError(
+                f"Unknown duplicate signal(s): {', '.join(bad)}. Valid: {', '.join(_DUP_SIGNALS)}."
+            )
+        flags.update({k: bool(v) for k, v in signals.items()})
+
+    if library_id is not None:
+        library_ids: list[int] = [library_id]
+    else:
+        libs = await client.get("/api/v1/libraries") or []
+        library_ids = [
+            lib["id"] for lib in libs if isinstance(lib, dict) and lib.get("id") is not None
+        ]
+
+    groups: list[dict] = []
+    for lib_id in library_ids:
+        result = (
+            await client.post("/api/v1/books/duplicates", json={"libraryId": lib_id, **flags}) or []
+        )
+        for grp in result:
+            books = grp.get("books") or []
+            isbns = {(_meta(b).get("isbn13") or _meta(b).get("isbn10")) for b in books}
+            isbns.discard(None)
+            groups.append(
+                {
+                    "library_id": lib_id,
+                    "match_reason": grp.get("matchReason"),
+                    "suggested_target_book_id": grp.get("suggestedTargetBookId"),
+                    "distinct_isbns": len(isbns) > 1,
+                    "books": [
+                        {
+                            "id": b.get("id"),
+                            "title": b.get("title") or _meta(b).get("title"),
+                            "authors": _author_names(_meta(b)),
+                            "isbn13": _meta(b).get("isbn13"),
+                            "isbn10": _meta(b).get("isbn10"),
+                        }
+                        for b in books
+                    ],
+                }
+            )
+    return {"libraries_scanned": len(library_ids), "group_count": len(groups), "groups": groups}
+
+
+@mcp.tool(annotations={"idempotentHint": True, "title": "Normalize Goodreads IDs"})
+async def normalize_goodreads_ids(dry_run: bool = True) -> dict:
+    """One-time cleanup: rewrite any stored goodreadsId held in slug form
+    ("23463279-designing-data-intensive-applications") to its bare numeric id
+    ("23463279"). BookLore persists both forms depending on the fetch path, and writes
+    through this MCP are normalized going forward — but pre-existing records aren't.
+
+    Scans the whole library. With dry_run=True (default) it only REPORTS what it would
+    change (review first); pass dry_run=False to apply. Each write touches only the
+    goodreadsId field (REPLACE_WHEN_PROVIDED, nothing else is altered).
+    Returns {scanned, dry_run, to_change|changed:[{book_id,from,to}], failed}.
+    """
+    books = await _all_books(with_description=True)
+    changes: list[dict] = []
+    for b in books:
+        gid = _meta(b).get("goodreadsId")
+        if not isinstance(gid, str) or not gid:
+            continue
+        norm = _normalize_goodreads_id(gid)
+        if norm != gid:
+            changes.append({"book_id": b.get("id"), "from": gid, "to": norm})
+
+    if dry_run:
+        return {"scanned": len(books), "dry_run": True, "to_change": changes, "failed": []}
+
+    changed: list[dict] = []
+    failed: list[dict] = []
+    for ch in changes:
+        try:
+            await _put_metadata(ch["book_id"], {"goodreadsId": ch["to"]})
+            changed.append(ch)
+        except Exception as exc:
+            failed.append({"book_id": ch["book_id"], "error": str(exc)})
+    return {"scanned": len(books), "dry_run": False, "changed": changed, "failed": failed}
 
 
 def main() -> None:

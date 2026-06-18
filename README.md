@@ -21,15 +21,17 @@ your BookLore login (JWT, auto-refreshed).
 | `list_authors` | read | Distinct authors with per-author book counts |
 | `books_by_author` | read | Books by a given author |
 | `get_reading_stats` | read | Counts by read status + average rating |
-| `export_library` | read | Export the library (or a shelf) as JSON or CSV |
+| `export_library` | read | Export the library (or a shelf) as JSON or CSV; `fields` projection or `full=True` for ISBN/ASIN/ratings/IDs |
+| `find_duplicates` | read | Group duplicate books via BookLore's native detection (presets + per-signal control) |
 | `ping` | read | Liveness + auth probe (down vs. logged-out), server version, counts |
 | `isbn_lookup` | read | Fetch metadata for an ISBN from external providers |
-| `fetch_metadata_candidates` | read | Fetch candidate metadata from external providers (review, then apply) |
+| `fetch_metadata_candidates` | read | Fetch candidate metadata from external providers (review, then apply); per-provider status |
 | `add_tags` / `remove_tags` | write | Add/remove tags on a book (merge, idempotent) |
 | `add_categories` / `remove_categories` | write | Add/remove categories (merge, idempotent) |
-| `bulk_update_metadata` | write | Apply tag/category patches to many books (partial-success) |
+| `bulk_update_metadata` | write | Apply per-book patches to many books — tags/categories, arbitrary fields, clears (partial-success) |
+| `bulk_set_read_status` | write | Set per-book reading status in bulk (e.g. a Goodreads import), grouped by status |
 | `set_field_locks` | write | Lock/unlock metadata fields so curated values survive a refresh |
-| `update_book_metadata` | write | Edit a book's metadata (field-merge by default; opt into REPLACE_ALL to wipe omitted fields) |
+| `update_book_metadata` | write | Edit a book's metadata (field-merge by default; `clear_fields` to null a field; REPLACE_ALL to wipe omitted) |
 | `set_read_status` | write | Set reading status (READING/READ/…) |
 | `set_personal_rating` | write | Set your rating |
 | `assign_shelves` | write | Set books' shelves (add and/or remove) |
@@ -39,17 +41,26 @@ your BookLore login (JWT, auto-refreshed).
 | `set_reading_progress` | write | Record reading position / % for a book file |
 | `reset_progress` | write | Clear reading progress (destructive) |
 
-For bulk tagging/enrichment, prefer `search_books` (especially the `missing` filter
-to find un-enriched books) plus the additive `add_tags`/`add_categories` and
-`bulk_update_metadata` — they merge by default and touch only the fields they manage.
-`update_book_metadata` defaults to `REPLACE_WHEN_PROVIDED` (writes only the fields you
-include, leaving the rest intact) — use that for fill-in enrichment. Its `REPLACE_ALL`
-mode replaces the **whole** record (any field you omit is wiped to null), so reserve it
-for deliberate full-record edits, and lock curated fields with `set_field_locks` first.
+For bulk tagging/enrichment, prefer `search_books` (especially the `missing` filter —
+now covering identifier/rating fields like `asin`/`goodreadsId`/`amazonRating`, with a
+`missing_mode: any` for "lacking at least one") to find un-enriched books, plus the
+additive `add_tags`/`add_categories` and `bulk_update_metadata` — they merge by default
+and touch only the fields they manage. `update_book_metadata` defaults to
+`REPLACE_WHEN_PROVIDED` (writes only the fields you include, leaving the rest intact) —
+use that for fill-in enrichment; pass `clear_fields` to null a single field without
+touching the others. Its `REPLACE_ALL` mode replaces the **whole** record (any field you
+omit is wiped to null), so reserve it for deliberate full-record edits, and lock curated
+fields with `set_field_locks` first.
 
 `fetch_metadata_candidates` and `isbn_lookup` depend on BookLore's external metadata
-providers (Google, GoodReads, Amazon, …) being reachable and configured on your
-server — if they aren't, these return empty results.
+providers (Google, GoodReads, Amazon, …) being reachable and configured on your server.
+`fetch_metadata_candidates` defaults its search terms from the book's own stored
+metadata (so `book_id` alone works) and returns a `provider_status` for each requested
+provider — `ok` / `empty` / `disabled` — so a dead or unconfigured provider (e.g. Amazon
+without a session cookie) is distinguishable from a genuine no-match. Each candidate
+carries only its own provider's fields (Amazon → `asin`/`amazonRating`, GoodReads →
+`goodreadsId`/`goodreadsRating`, Google → `googleId`), so include the provider that owns
+the field you want to fill.
 
 ## Setup
 

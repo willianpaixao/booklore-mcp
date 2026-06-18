@@ -68,6 +68,53 @@ async def test_update_metadata_always_sends_clear_flags(authed):
     assert request.url.params["mergeCategories"] == "true"
 
 
+async def test_update_metadata_clear_fields_and_normalizes_goodreads_id(authed):
+    route = authed.put(f"{BASE}/api/v1/books/5/metadata").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    async with Client(server.mcp) as mcp_client:
+        await mcp_client.call_tool(
+            "update_book_metadata",
+            {
+                "book_id": 5,
+                "metadata": {"goodreadsId": "23463279-designing-data-intensive"},
+                "clear_fields": ["amazonRating"],
+            },
+        )
+
+    body = json.loads(route.calls.last.request.content)
+    # clear_fields -> a true clearFlag, the only way to null one field under the safe mode.
+    assert body["clearFlags"] == {"amazonRating": True}
+    # goodreadsId slug normalized to its bare numeric form on write.
+    assert body["metadata"]["goodreadsId"] == "23463279"
+
+
+async def test_update_metadata_rejects_unknown_clear_field(authed):
+    async with Client(server.mcp) as mcp_client:
+        with pytest.raises(Exception, match="Cannot clear unknown field"):
+            await mcp_client.call_tool(
+                "update_book_metadata",
+                {"book_id": 5, "metadata": {}, "clear_fields": ["bogus"]},
+            )
+
+
+async def test_bulk_update_metadata_writes_arbitrary_fields(authed):
+    authed.get(f"{BASE}/api/v1/books/3").mock(
+        return_value=httpx.Response(200, json={"id": 3, "metadata": {}})
+    )
+    put = authed.put(f"{BASE}/api/v1/books/3/metadata").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    async with Client(server.mcp) as mcp_client:
+        await mcp_client.call_tool(
+            "bulk_update_metadata",
+            {"book_ids": [3], "patch": {"metadata": {"isbn13": "999", "language": "en"}}},
+        )
+
+    body = json.loads(put.calls.last.request.content)
+    assert body["metadata"] == {"isbn13": "999", "language": "en"}
+
+
 async def test_delete_shelf_returns_confirmation(authed):
     authed.delete(f"{BASE}/api/v1/shelves/3").mock(return_value=httpx.Response(204))
 
