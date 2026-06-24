@@ -23,6 +23,9 @@ your BookLore login (JWT, auto-refreshed).
 | `get_reading_stats` | read | Counts by read status + average rating |
 | `export_library` | read | Export the library (or a shelf) as JSON or CSV; `fields` projection or `full=True` for ISBN/ASIN/ratings/IDs |
 | `find_duplicates` | read | Group duplicate books via BookLore's native detection (presets + per-signal control) |
+| `list_libraries` | read | List libraries and their on-disk paths (id, name, watch, paths, allowed formats) |
+| `refresh_library` | write | Rescan a library's paths so BookLore ingests files added on disk |
+| `bookdrop_rescan` | write | Rescan BookLore's bookdrop folder for newly added files (staged for review) |
 | `ping` | read | Liveness + auth probe (down vs. logged-out), server version, counts |
 | `isbn_lookup` | read | Fetch metadata for an ISBN from external providers |
 | `fetch_metadata_candidates` | read | Fetch candidate metadata from external providers (review, then apply); per-provider status |

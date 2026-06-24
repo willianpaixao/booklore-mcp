@@ -1505,6 +1505,63 @@ async def find_duplicates(
     return {"libraries_scanned": len(library_ids), "group_count": len(groups), "groups": groups}
 
 
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "List libraries"})
+async def list_libraries() -> list[dict]:
+    """List BookLore libraries and their on-disk paths.
+
+    Files are ingested into a library *path* on the BookLore host (e.g. by dropping
+    them into a watched folder); this surfaces each library's id, name, whether it's
+    watched, its paths (id + filesystem path), and allowed formats — the context you
+    need to know where a manually-added book will land and which library to rescan.
+    Returns [{id, name, watch, paths:[{id, path}], allowed_formats}].
+    """
+    libs = await client.get("/api/v1/libraries") or []
+    out: list[dict] = []
+    for lib in libs:
+        if not isinstance(lib, dict):
+            continue
+        out.append(
+            {
+                "id": lib.get("id"),
+                "name": lib.get("name"),
+                "watch": lib.get("watch"),
+                "paths": [
+                    {"id": p.get("id"), "path": p.get("path")}
+                    for p in (lib.get("paths") or [])
+                    if isinstance(p, dict)
+                ],
+                "allowed_formats": lib.get("allowedFormats"),
+            }
+        )
+    return out
+
+
+@mcp.tool(annotations={"idempotentHint": True, "openWorldHint": True, "title": "Refresh library"})
+async def refresh_library(library_id: int) -> dict:
+    """Trigger a rescan of a library's paths so BookLore ingests files added on disk.
+
+    Use after manually placing a book (e.g. a safaribooks EPUB) into one of the
+    library's paths — BookLore re-walks the paths, imports new files and reads their
+    embedded metadata. Scanning runs server-side and may take a moment to reflect in
+    the book list. Use `list_libraries` to find the id. Returns {library_id, status}.
+    """
+    await client.put(f"/api/v1/libraries/{library_id}/refresh")
+    return {"library_id": library_id, "status": "rescan triggered"}
+
+
+@mcp.tool(annotations={"idempotentHint": True, "openWorldHint": True, "title": "Rescan bookdrop"})
+async def bookdrop_rescan() -> dict:
+    """Trigger a rescan of BookLore's bookdrop folder for files added on disk.
+
+    BookLore watches a dedicated "bookdrop" folder; files dropped there are staged for
+    review before import. Use this to pick up files added while the watcher was down or
+    that it missed. Staged files still need finalizing in the BookLore UI before they
+    enter a library. Returns {status}.
+    """
+    await client.post("/api/v1/bookdrop/rescan")
+    return {"status": "bookdrop rescan triggered"}
+
+
 @mcp.tool(annotations={"idempotentHint": True, "title": "Normalize Goodreads IDs"})
 async def normalize_goodreads_ids(dry_run: bool = True) -> dict:
     """One-time cleanup: rewrite any stored goodreadsId held in slug form
