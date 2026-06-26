@@ -152,9 +152,7 @@ async def test_list_libraries_trims_fields(authed):
 
 
 async def test_refresh_library_triggers_rescan(authed):
-    route = authed.put(f"{BASE}/api/v1/libraries/7/refresh").mock(
-        return_value=httpx.Response(200)
-    )
+    route = authed.put(f"{BASE}/api/v1/libraries/7/refresh").mock(return_value=httpx.Response(200))
 
     async with Client(server.mcp) as mcp_client:
         result = await mcp_client.call_tool("refresh_library", {"library_id": 7})
@@ -165,9 +163,7 @@ async def test_refresh_library_triggers_rescan(authed):
 
 
 async def test_bookdrop_rescan_triggers_scan(authed):
-    route = authed.post(f"{BASE}/api/v1/bookdrop/rescan").mock(
-        return_value=httpx.Response(200)
-    )
+    route = authed.post(f"{BASE}/api/v1/bookdrop/rescan").mock(return_value=httpx.Response(200))
 
     async with Client(server.mcp) as mcp_client:
         result = await mcp_client.call_tool("bookdrop_rescan", {})
