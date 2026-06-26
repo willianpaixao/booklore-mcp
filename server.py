@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal, get_args
 
 import httpx
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel
 
@@ -1139,6 +1139,7 @@ async def bulk_update_metadata(
     book_ids: list[int] | None = None,
     patch: dict | None = None,
     items: list[dict] | None = None,
+    ctx: Context | None = None,
 ) -> dict:
     """Apply per-book metadata patches to many books in one call.
 
@@ -1160,8 +1161,11 @@ async def bulk_update_metadata(
 
     work = items if items else [{"book_id": bid, "patch": patch} for bid in (book_ids or [])]
     semaphore = asyncio.Semaphore(BULK_CONCURRENCY)
+    total = len(work)
+    done = 0
 
     async def _one(entry: dict) -> tuple[Any, Any, dict | None]:
+        nonlocal done
         bid = entry.get("book_id")
         async with semaphore:
             try:
@@ -1170,6 +1174,12 @@ async def bulk_update_metadata(
                 return bid, await _apply_patch(bid, entry.get("patch") or {}), None
             except Exception as exc:
                 return bid, None, {"book_id": bid, "error": str(exc)}
+            finally:
+                # Report as each book finishes (success or failure); tasks run
+                # concurrently, so progress need not arrive in input order.
+                done += 1
+                if ctx is not None:
+                    await ctx.report_progress(progress=done, total=total)
 
     updated: list[int] = []
     failed: list[dict] = []
@@ -1400,7 +1410,7 @@ async def remove_from_shelves(book_ids: list[int], shelf_ids: list[int]) -> list
 
 
 @mcp.tool(annotations={"idempotentHint": True, "title": "Bulk set read status"})
-async def bulk_set_read_status(items: list[dict]) -> dict:
+async def bulk_set_read_status(items: list[dict], ctx: Context | None = None) -> dict:
     """Set per-book reading status in bulk — e.g. importing a Goodreads CSV where each
     book has its own status. `items` is [{"book_id": int, "status": ReadStatus}], with
     status one of UNREAD/READING/RE_READING/READ/PARTIALLY_READ/PAUSED/WONT_READ/
@@ -1420,10 +1430,14 @@ async def bulk_set_read_status(items: list[dict]) -> dict:
 
     updated: list[int] = []
     by_status: dict[str, int] = {}
+    # One backend call per status group; report books processed as each lands.
+    total = sum(len(ids) for ids in groups.values())
     for status, ids in groups.items():
         await client.post("/api/v1/books/status", json={"bookIds": ids, "status": status})
         updated.extend(ids)
         by_status[status] = len(ids)
+        if ctx is not None:
+            await ctx.report_progress(progress=len(updated), total=total)
     return {"updated": updated, "by_status": by_status, "failed": failed}
 
 
