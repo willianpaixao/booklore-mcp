@@ -3,45 +3,99 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege by default; the docker job alone gets packages: write to publish.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded PR runs are cancelled; main/tag runs finish so an image push isn't cut off.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
+  lint:
+    name: Lint & Format Check
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        # setup-uv publishes no floating major tags since v8 — pin a full version.
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Check uv.lock matches pyproject.toml
+        # `--frozen` below trusts the lockfile as-is; this catches a pyproject.toml edit
+        # (e.g. from a Dependabot PR) that left uv.lock out of date.
+        run: uv lock --check
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Run ruff linter
+        run: uv run ruff check .
+
+      - name: Run ruff formatter check
+        run: uv run ruff format --check .
+
+  typecheck:
+    name: Type Check (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Run mypy
+        run: uv run mypy
+
+  test:
+    name: Test Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        os: [ubuntu-latest]
+        python-version: ["3.12", "3.13", "3.14"]
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
 
       - name: Sync dependencies
         run: uv sync --frozen --python ${{ matrix.python-version }}
 
-      - name: Lint
-        run: uv run ruff check .
-
-      - name: Format check
-        run: uv run ruff format --check .
-
-      - name: Type check
-        run: uv run mypy
-
-      - name: Test
-        run: uv run pytest
+      - name: Run tests
+        run: uv run pytest -v --tb=short
 
   audit:
+    name: Dependency Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
 
@@ -51,12 +105,133 @@ jobs:
           uvx pip-audit -r requirements.txt
 
   docker:
+    # Builds the image on every run and smoke-tests it. Only a pushed v* release tag
+    # publishes: main pushes and PRs build and test but never push an image.
+    name: Docker Image (build, smoke test, publish on release tag)
     runs-on: ubuntu-latest
+    needs: [lint, typecheck, test, audit]
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v7
 
-      - name: Build image
-        uses: docker/build-push-action@v6
+      - name: Check the release tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")"
+          if [[ "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match pyproject.toml version $version"
+            exit 1
+          fi
+
+      - name: Image name (GHCR requires lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Set up QEMU (arm64 builds)
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          # Tag v1.2.3 -> 1.2.3, 1.2, latest and sha-<short>. A pre-release (v1.3.0-rc1) gets
+          # only 1.3.0-rc1 and sha-<short>, so `latest` always means the newest stable release.
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
+            type=sha
+
+      - name: Build image for smoke test (amd64, loaded locally)
+        uses: docker/build-push-action@v7
         with:
           context: .
-          push: false
+          load: true
+          tags: booklore-mcp:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image
+        run: |
+          set -euo pipefail
+
+          # Runs as the unprivileged app user, not root.
+          uid="$(docker run --rm booklore-mcp:ci id -u)"
+          [[ "$uid" != "0" ]] || { echo "image runs as root"; exit 1; }
+
+          # Entrypoints import and every tool registers.
+          docker run --rm booklore-mcp:ci python -c "
+          import asyncio, server, booklore_mcp
+          from fastmcp import Client
+          assert server.mcp is booklore_mcp.mcp and callable(server.main)
+          async def names():
+              async with Client(booklore_mcp.mcp) as c:
+                  return [t.name for t in await c.list_tools()]
+          tools = asyncio.run(names())
+          assert 'search_books' in tools and 'match_books' in tools, tools
+          print(f'entrypoints OK, {len(tools)} tools registered')
+          "
+
+          # The HTTP server starts and answers an MCP initialize. That doesn't touch
+          # BookLore, so no credentials are needed.
+          docker run -d --name booklore-mcp-ci -p 127.0.0.1:8000:8000 booklore-mcp:ci
+          trap 'docker logs booklore-mcp-ci || true; docker rm -f booklore-mcp-ci >/dev/null' EXIT
+          init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}'
+          for _ in $(seq 1 30); do
+            resp="$(curl -fsS --max-time 5 -X POST http://127.0.0.1:8000/mcp \
+                      -H 'Content-Type: application/json' \
+                      -H 'Accept: application/json, text/event-stream' \
+                      -d "$init" 2>/dev/null || true)"
+            if grep -q '"booklore"' <<<"$resp"; then
+              echo "HTTP transport OK"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MCP server did not answer initialize within 30s"
+          exit 1
+
+      - name: Log in to GitHub Container Registry
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (amd64 + arm64)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  all-checks:
+    name: All Checks Passed
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck, test, audit, docker]
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          if [[ "${{ needs.lint.result }}" != "success" ]] || \
+             [[ "${{ needs.typecheck.result }}" != "success" ]] || \
+             [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.audit.result }}" != "success" ]] || \
+             [[ "${{ needs.docker.result }}" != "success" ]]; then
+            echo "One or more checks failed!"
+            exit 1
+          fi
+          echo "All checks passed!"

@@ -1,8 +1,12 @@
 # syntax=docker/dockerfile:1
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+# Pinned base image: an exact uv release with Python 3.13 on Debian 13 (trixie) slim, plus
+# its multi-arch (amd64/arm64) index digest, so every build starts from identical layers.
+# Bump the tag and the digest together. Don't go back to a floating tag:
+# `python3.13-bookworm-slim` stopped moving at uv 0.9.30 when uv dropped bookworm images.
+FROM ghcr.io/astral-sh/uv:0.13.6-python3.13-trixie-slim@sha256:e586c1c65b7071aec78f02c5587c76c5011159cd76b3d6f1255f40e48e850abc
 
 # uv tuning: copy deps into the image (no symlinks to the cache) and don't try to
-# manage the Python install — the base image already provides 3.12.
+# manage the Python install — the base image already provides 3.13.
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
@@ -16,7 +20,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --no-dev
 
 # Then the application code, and install the project itself.
-COPY server.py log.py README.md LICENSE ./
+COPY src ./src
+COPY server.py README.md LICENSE ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 

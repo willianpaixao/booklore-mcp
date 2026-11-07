@@ -9,7 +9,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from server import BookLoreClient, BookLoreError
+from booklore_mcp.client import BookLoreClient, BookLoreError
 
 BASE = "http://booklore.test"
 
@@ -128,3 +128,20 @@ async def test_book_list_cache_served_then_invalidated_on_write(respx_mock):
     await client.post("/api/v1/books/status", json={"bookIds": [1], "status": "READ"})
     await client.get_books()
     assert books.call_count == 2  # write invalidated the cache
+
+
+async def test_fresh_full_book_list_also_serves_light_requests(respx_mock):
+    _login_route(respx_mock)
+    books = respx_mock.get(f"{BASE}/api/v1/books").mock(
+        return_value=httpx.Response(200, json=[{"id": 1}])
+    )
+
+    client = BookLoreClient(BASE, "tester", "secret", cache_ttl=30)
+    await client.get_books(with_description=True)
+    await client.get_books()  # light request: answered by the full list (a superset)
+    assert books.call_count == 1
+
+    light_first = BookLoreClient(BASE, "tester", "secret", cache_ttl=30)
+    await light_first.get_books()
+    await light_first.get_books(with_description=True)  # light can't stand in for full
+    assert books.call_count == 3

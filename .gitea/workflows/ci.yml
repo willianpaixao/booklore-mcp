@@ -17,10 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        # setup-uv publishes no floating major tags since v8 — pin a full version.
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
 
@@ -38,10 +39,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
 
@@ -58,14 +59,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.12", "3.13", "3.14"]
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
 
@@ -75,15 +76,39 @@ jobs:
       - name: Run tests
         run: uv run pytest -v --tb=short
 
+  package:
+    name: Build & Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Build sdist + wheel (from the src/ layout)
+        run: uv build
+
+      - name: Sync dependencies (installs the built package)
+        run: uv sync --frozen
+
+      - name: Smoke-test entrypoints and tool registration
+        run: >
+          uv run python -c "import server, booklore_mcp;
+          assert server.mcp is booklore_mcp.mcp and callable(server.main);
+          print('shim + package entrypoints OK')"
+
   audit:
     name: Dependency Audit
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
 
@@ -92,10 +117,12 @@ jobs:
           uv export --frozen --no-dev --no-emit-project --format requirements-txt -o requirements.txt
           uvx pip-audit -r requirements.txt
 
+  # NB: no docker job here — the Gitea runner doesn't build images (see commit
+  # "fix(ci): remove docker from gitea workflow"). GitHub Actions covers the image build.
   all-checks:
     name: All Checks Passed
     runs-on: ubuntu-latest
-    needs: [lint, typecheck, test, audit, docker]
+    needs: [lint, typecheck, test, package, audit]
     if: always()
     steps:
       - name: Check results
@@ -103,6 +130,7 @@ jobs:
           if [[ "${{ needs.lint.result }}" != "success" ]] || \
              [[ "${{ needs.typecheck.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.package.result }}" != "success" ]] || \
              [[ "${{ needs.audit.result }}" != "success" ]]; then
             echo "One or more checks failed!"
             exit 1

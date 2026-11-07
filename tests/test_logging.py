@@ -6,7 +6,7 @@ import json
 
 import structlog
 
-from log import configure_logging, get_logger
+from booklore_mcp.log import configure_logging, get_logger
 
 
 def test_json_format_emits_one_json_object_per_line(capfd):

@@ -12,14 +12,19 @@ your BookLore login (JWT, auto-refreshed).
 
 | Tool | Kind | What it does |
 |---|---|---|
-| `search_books` | read | Search/filter the library (tags, categories, authors, shelves, **missing fields**), sorted + paginated |
-| `list_books` | read | List/search books (trimmed summaries) |
+| `search_books` | read | Search/filter the library (text query over title/series/ISBN/authors — use `search_titles` for subtitles; tags, categories, authors, shelves, **missing fields**), sorted + paginated |
+| `list_books` | read | Fast keyword lookup (title/series/ISBN/authors) returning trimmed summaries — the quickest way to find a book id |
 | `get_book` | read | Full record + metadata for one book |
 | `list_shelves` | read | All shelves |
 | `get_shelf_books` | read | Books on a shelf |
 | `get_recommendations` | read | Books similar to a given one |
 | `list_authors` | read | Distinct authors with per-author book counts |
-| `books_by_author` | read | Books by a given author |
+| `books_by_author` | read | Books by a given author; suggests the closest author names on a miss |
+| `search_titles` | read | Approximate (typo-tolerant) search over title, subtitle, series name and tags — ignores authors/ISBNs; whole library by default, optional kind/library/shelf/category scope; each hit reports `matched_on` + `score` |
+| `match_books` | read | Resolve a list of `{title, author}` rows (e.g. a Goodreads CSV) to book ids — matched / ambiguous / unmatched per row, with candidates |
+| `list_genres` | read | Distinct genres (BookLore categories) with per-genre book counts |
+| `books_by_genre` | read | Books in a given genre; filter books vs comics; suggests the closest genres on a miss |
+| `find_series_gaps` | read | Missing volumes/issues in book and comic series (owned, missing, unnumbered); suggests the closest series names on a miss |
 | `get_reading_stats` | read | Counts by read status + average rating |
 | `export_library` | read | Export the library (or a shelf) as JSON or CSV; `fields` projection or `full=True` for ISBN/ASIN/ratings/IDs |
 | `find_duplicates` | read | Group duplicate books via BookLore's native detection (presets + per-signal control) |
@@ -39,6 +44,7 @@ your BookLore login (JWT, auto-refreshed).
 | `set_personal_rating` | write | Set your rating |
 | `assign_shelves` | write | Set books' shelves (add and/or remove) |
 | `add_to_shelves` / `remove_from_shelves` | write | Additive shelf membership (idempotent) |
+| `organize_shelves` | write | Create shelves and file books/comics into them from a plan — preview (`dry_run`) first, additive only |
 | `create_shelf` | write | Create a shelf |
 | `delete_shelf` | write | Delete a shelf (destructive) |
 | `set_reading_progress` | write | Record reading position / % for a book file |
@@ -64,6 +70,26 @@ without a session cookie) is distinguishable from a genuine no-match. Each candi
 carries only its own provider's fields (Amazon → `asin`/`amazonRating`, GoodReads →
 `goodreadsId`/`goodreadsRating`, Google → `googleId`), so include the provider that owns
 the field you want to fill.
+
+"Kind" is derived from a book's primary file: CBX archives (cbz/cbr/cb7) are **comics**,
+audiobook files are **audiobooks**, everything else is a **book**. `search_titles`,
+`books_by_genre`, `find_series_gaps` and the `search_books` `kind` filter all accept it,
+and `export_library` can project it as a `kind` field; book summaries also carry it as
+`kind` (null when the record has no file info). `find_series_gaps` positions each
+book by `seriesNumber` (falling back to a numeric comic `issueNumber`); when BookLore
+knows the series total it also reports missing trailing volumes, otherwise only gaps
+inside the run you own.
+
+### Organising shelves with an LLM
+
+`organize_shelves` takes a plan — `[{"shelf": "...", "book_ids": [...]}]` — and by default
+only **previews** it: which shelves would be created or reused, what would be added, what
+is already there, and any unknown ids, split into books/comics/audiobooks. Nothing is
+written until it is called again with `dry_run: false`, and it only ever *adds* books to
+shelves. The `organize_library` MCP prompt drives the whole loop: give it a context
+("by reading mood", "a shelf per decade", "separate manga from western comics"), and the
+assistant reads the library, drafts the shelves, shows you the preview, and applies it
+only after you approve.
 
 ## Setup
 
@@ -91,7 +117,7 @@ The server reads three environment variables (see `.env.example`):
   exponential backoff (default `2`); `BOOKLORE_BACKOFF` sets the base delay in
   seconds (default `0.5`).
 - `BOOKLORE_CACHE_TTL` — seconds to cache the full book list, shared by the
-  search/stats/export tools (default `10`; `0` disables). Any write to a book
+  search/stats/export tools (default `60`; `0` disables). Any write to a book
   invalidates it immediately.
 - `BOOKLORE_BULK_CONCURRENCY` — max concurrent per-book operations in
   `bulk_update_metadata` (default `1`, i.e. sequential). BookLore stores tags and
@@ -129,7 +155,9 @@ uv run server.py
 
 Serves streamable-HTTP MCP at `http://127.0.0.1:8000/mcp`. Override with
 `MCP_HOST`, `MCP_PORT`, `MCP_PATH`. Press Ctrl-C to stop. `uv run booklore-mcp`
-(the installed console script) is equivalent to `uv run server.py`.
+(the installed console script) and `uv run python -m booklore_mcp` are both
+equivalent to `uv run server.py` — the code lives in the `src/booklore_mcp`
+package and `server.py` is a thin launcher kept for backwards compatibility.
 
 > **Security:** this endpoint has no auth of its own and acts with your BookLore
 > credentials, so anyone who can reach the port controls your library. Keep it
@@ -151,6 +179,24 @@ this is the form an MCP host launches directly (see Claude Code/Desktop below).
 The image runs the HTTP transport bound to `0.0.0.0` inside the container; you
 control exposure with the published port. Credentials are passed in at runtime, so
 they're never baked into the image.
+
+Each release tag `vX.Y.Z` publishes a pre-built multi-arch image (`linux/amd64` and
+`linux/arm64`) to GitHub Container Registry, tagged `X.Y.Z`, `X.Y`, `sha-<short>` and,
+for stable releases, `latest`. A pre-release such as `v1.3.0-rc1` gets only its exact
+version and never moves `latest`. Pushes to `main` build and test the image without
+publishing it.
+
+```bash
+docker pull ghcr.io/magnus1990p/booklore-mcp:latest
+docker run --rm --env-file .env -p 127.0.0.1:8000:8000 ghcr.io/magnus1990p/booklore-mcp:latest
+```
+
+To cut a release, bump `version` in `pyproject.toml`, commit, and push a matching tag
+(`git tag v0.2.0 && git push origin v0.2.0`). CI refuses to publish when the tag and
+`pyproject.toml` disagree.
+
+Forks publish under their own owner (`ghcr.io/<owner>/booklore-mcp`). To build locally
+instead:
 
 ```bash
 docker build -t booklore-mcp .
@@ -303,12 +349,15 @@ instance is needed.
 uv run pytest               # run the test suite
 uv run ruff check .         # lint
 uv run ruff format .        # format
-uv run mypy                 # type check (server.py, log.py)
+uv run mypy                 # type check (src/booklore_mcp + the server.py shim)
 ```
 
 CI (`.github/workflows/ci.yml`) runs lint, format check, type check, and tests
-across Python 3.10–3.13 on every push and pull request, plus a dependency
-vulnerability scan (`pip-audit`) and a Docker image build.
+across Python 3.12–3.14 on every push and pull request, plus a dependency
+vulnerability scan (`pip-audit`). Once those pass, it builds the Docker image and
+smoke-tests it: the image runs as a non-root user, every tool registers, and the HTTP
+server answers an MCP `initialize`. Only a pushed `v*` release tag publishes the image
+to GitHub Container Registry; `main` pushes and pull requests never publish.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev workflow, how to add a tool, and
 testing conventions.

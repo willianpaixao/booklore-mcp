@@ -1,0 +1,36 @@
+# Dependabot version updates: opens PRs when dependencies fall behind.
+# Security updates are separate: enable "Dependabot alerts" and "Dependabot security
+# updates" under Settings → Code security.
+version: 2
+
+updates:
+  # Python dependencies: pyproject.toml (ranges) and uv.lock (pinned versions).
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    # Wait a few days before proposing a new release, so a compromised or quickly
+    # yanked version is usually caught before it reaches a PR.
+    cooldown:
+      default-days: 5
+      semver-major-days: 14
+    groups:
+      # One PR for all minor/patch bumps; majors still get their own PR each.
+      python-minor-and-patch:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "deps"
+    open-pull-requests-limit: 5
+
+  # Dockerfile base image. It is pinned as `<uv version>-python3.13-trixie-slim@sha256:…`;
+  # Dependabot keeps the `-python3.13-trixie-slim` suffix and bumps the version and
+  # digest together.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "docker"
+    open-pull-requests-limit: 5
