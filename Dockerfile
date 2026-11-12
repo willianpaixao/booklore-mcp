@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+FROM ghcr.io/astral-sh/uv:python3.14-trixie-slim
 
 # uv tuning: copy deps into the image (no symlinks to the cache) and don't try to
-# manage the Python install — the base image already provides 3.12.
+# manage the Python install — the base image already provides 3.14.
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never

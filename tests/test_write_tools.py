@@ -266,3 +266,10 @@ async def test_reset_progress_everything(authed):
     )
     d = (await _call("reset_progress", {"book_ids": [5], "scope": "everything"})).data
     assert route.called and d == {"scope": "everything", "reset": [5], "failed": []}
+
+
+def test_normalize_goodreads_id_strips_slug_keeps_numeric():
+    assert server._normalize_goodreads_id("23463279-designing-data-intensive") == "23463279"
+    assert server._normalize_goodreads_id("171712768") == "171712768"
+    assert server._normalize_goodreads_id("  42  ") == "42"
+    assert server._normalize_goodreads_id(None) is None

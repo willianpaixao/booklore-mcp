@@ -533,3 +533,61 @@ async def test_find_duplicates_validates_arguments(authed, args, match):
     async with Client(server.mcp) as c:
         result = await c.call_tool("find_duplicates", args, raise_on_error=False)
     assert result.is_error and match in result.content[0].text
+
+
+# --- ping ------------------------------------------------------------------------------
+
+
+async def test_ping_reports_identity_version_and_counts(authed):
+    authed.get(f"{BASE}/api/v1/health").mock(
+        return_value=httpx.Response(200, json={"status": "ok"})
+    )
+    me = authed.get(f"{BASE}/api/v1/auth/me").mock(
+        return_value=httpx.Response(
+            200,
+            json={"username": "ann", "authenticationMethod": "api_key", "permissions": ["x"]},
+        )
+    )
+    authed.get(f"{BASE}/api/v1/app-info").mock(
+        return_value=httpx.Response(200, json={"version": "v3.8.0", "updateAvailable": False})
+    )
+    authed.get(f"{BASE}/api/v1/libraries").mock(return_value=httpx.Response(200, json=[{"id": 1}]))
+    authed.get(f"{BASE}/api/v1/statistics/summary").mock(
+        return_value=httpx.Response(200, json={"totalBooks": 433})
+    )
+
+    async with Client(server.mcp) as c:
+        result = await c.call_tool("ping", {})
+
+    d = result.data
+    assert d["ok"] is True and d["authenticated"] is True
+    assert d["user"] == "ann" and d["authentication_method"] == "api_key"
+    assert d["permissions"] == ["x"]
+    assert d["server_version"] == "v3.8.0" and "latest_version" not in d
+    assert d["library_count"] == 1 and d["book_count"] == 433
+    assert me.calls.last.request.headers["X-Api-Key"].startswith("bok_")
+
+
+async def test_ping_up_but_key_rejected(authed):
+    authed.get(f"{BASE}/api/v1/health").mock(
+        return_value=httpx.Response(200, json={"status": "ok"})
+    )
+    authed.get(f"{BASE}/api/v1/auth/me").mock(
+        return_value=httpx.Response(401, json={"statusCode": 401, "message": "Unauthorized"})
+    )
+
+    async with Client(server.mcp) as c:
+        result = await c.call_tool("ping", {})
+
+    d = result.data
+    assert d["ok"] is True and d["authenticated"] is False
+    assert "API key was rejected" in d["error"]
+
+
+async def test_ping_reports_unreachable(authed):
+    authed.get(f"{BASE}/api/v1/health").mock(side_effect=httpx.ConnectError("refused"))
+
+    async with Client(server.mcp) as c:
+        result = await c.call_tool("ping", {})
+
+    assert result.data["ok"] is False and "refused" in result.data["error"]

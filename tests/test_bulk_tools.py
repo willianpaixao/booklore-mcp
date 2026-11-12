@@ -246,3 +246,27 @@ async def test_book_dock_rescan_without_read_access(authed):
     )
     d = (await _call("book_dock_rescan", {})).data
     assert d == {"status": "book dock rescan triggered"}
+
+
+async def test_bulk_set_read_status_groups_by_status(authed):
+    route = authed.post(f"{BASE}/api/v1/books/bulk-set-status").mock(
+        return_value=httpx.Response(204)
+    )
+    async with Client(server.mcp) as c:
+        result = await c.call_tool(
+            "bulk_set_read_status",
+            {
+                "items": [
+                    {"book_id": 1, "status": "read"},
+                    {"book_id": 2, "status": "read"},
+                    {"book_id": 3, "status": "reading"},
+                    {"book_id": 4, "status": "READ"},
+                ]
+            },
+        )
+
+    d = result.data
+    assert sorted(d["updated"]) == [1, 2, 3]
+    assert d["by_status"] == {"read": 2, "reading": 1}
+    assert d["failed"][0]["book_id"] == 4
+    assert route.call_count == 2  # one call per distinct valid status, not per book

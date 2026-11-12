@@ -1,9 +1,9 @@
 [project]
 name = "bookorbit-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local MCP server wrapping a self-hosted BookOrbit instance's REST API"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Willian Paixão" }]
@@ -12,10 +12,9 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
 dependencies = [
@@ -50,20 +49,21 @@ dev = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 markers = [
     "integration: read-only tests against a live BookOrbit server (set BOOKORBIT_IT_URL)",
 ]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 files = ["server.py", "log.py"]
 ignore_missing_imports = true
 check_untyped_defs = true
