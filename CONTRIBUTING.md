@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve the BookLore MCP server! It's a single-file FastMCP
+Thanks for helping improve the BookOrbit MCP server! It's a single-file FastMCP
 server (`server.py`) plus a logging module (`log.py`), with tests under `tests/`.
 
 ## Setup
@@ -10,7 +10,7 @@ runtime + dev dependencies.
 
 ```bash
 uv sync
-cp .env.example .env   # add your BookLore URL + credentials (used for live testing)
+cp .env.example .env   # add your BookOrbit URL + API key
 ```
 
 ## Dev loop
@@ -21,16 +21,16 @@ Run all four before opening a PR — CI runs the same across Python 3.10–3.13:
 uv run ruff check .         # lint
 uv run ruff format .        # format (use --check in CI)
 uv run mypy                 # type check (server.py, log.py)
-uv run pytest               # tests — fully offline, no live BookLore needed
+uv run pytest               # tests — fully offline, no live BookOrbit needed
 ```
 
 ## Project layout
 
 | File | What's in it |
 |---|---|
-| `server.py` | The `BookLoreClient` (auth, retry, caching) + all `@mcp.tool` definitions |
+| `server.py` | The `BookOrbitClient` (auth, retry) + all `@mcp.tool` definitions |
 | `log.py` | structlog configuration (`configure_logging`, `get_logger`) |
-| `tests/` | `test_client.py` (HTTP client), `test_tools.py` / `test_search.py` (tools), `test_helpers.py`, `test_logging.py` |
+| `tests/` | `test_client.py` (HTTP client), `test_tools.py` / `test_search.py` (tools), `test_helpers.py`, `test_logging.py`; `integration/` holds opt-in live tests |
 
 ## Adding a tool
 
@@ -42,29 +42,29 @@ the right behavior hints. Call the shared `client` for HTTP.
 @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Count books"})
 async def count_books() -> dict:
     """Return the total number of books in the library."""
-    books = await client.get_books()
-    return {"count": len(books)}
+    summary = await client.get("/api/v1/statistics/summary")
+    return {"count": summary["totalBooks"]}
 ```
 
 Conventions:
 - **Annotations:** mark reads `readOnlyHint=True`; mark anything that overwrites or
   deletes `destructiveHint=True`; add `idempotentHint=True` when re-running is safe.
-- **Errors:** raise `BookLoreError` (a `ToolError` subclass) for user-facing failures
+- **Errors:** raise `BookOrbitError` (a `ToolError` subclass) for user-facing failures
   — transport/timeout errors are already wrapped for you.
-- **Reads over the whole library:** use `client.get_books()` (it's cached), not a raw
-  `client.get("/api/v1/books")`.
+- **Never load the whole library.** BookOrbit is built for libraries of tens of
+  thousands of books. Filter and sort on the server and page through results.
 - **Prefer additive writes** (merge) over `REPLACE_ALL`. See `_apply_patch`.
 - Keep line length ≤ 100 and let `ruff format` handle style.
 
 ## Testing
 
-Tests are offline: [`respx`](https://lundberg.github.io/respx/) mocks the BookLore
+Tests are offline: [`respx`](https://lundberg.github.io/respx/) mocks the BookOrbit
 API and FastMCP's in-memory `Client` drives the tools. Pattern:
 
 ```python
-async def test_count_books(authed):  # `authed` fixture mocks login + a fresh client
-    authed.get("http://booklore.test/api/v1/books").mock(
-        return_value=httpx.Response(200, json=[{"id": 1}, {"id": 2}])
+async def test_count_books(authed):  # `authed` gives a fresh client with a test API key
+    authed.get("http://bookorbit.test/api/v1/statistics/summary").mock(
+        return_value=httpx.Response(200, json={"totalBooks": 2})
     )
     async with Client(server.mcp) as c:
         result = await c.call_tool("count_books", {})
@@ -74,12 +74,19 @@ async def test_count_books(authed):  # `authed` fixture mocks login + a fresh cl
 For pure helpers (e.g. `_summarize_book`, `_matches_filters`), test the function
 directly — no mocking needed. Add at least one test per new tool or helper.
 
-Optionally smoke-test against a real instance (loads `.env`):
+### Live integration tests (opt-in)
+
+`tests/integration/` holds read-only tests against a real BookOrbit server. They
+are skipped unless `BOOKORBIT_IT_URL` is set, so the default run (and CI) stays
+offline. Use a read-only API key:
 
 ```bash
-set -a && source .env && set +a
-uv run fastmcp call server.py search_books --input-json '{"filters": {"missing": ["tags"]}}'
+BOOKORBIT_IT_URL=https://books.example.com \
+BOOKORBIT_IT_API_KEY=bok_... \
+uv run pytest -m integration
 ```
+
+Integration tests must never write to the server.
 
 ## Pull requests
 
@@ -87,4 +94,4 @@ uv run fastmcp call server.py search_books --input-json '{"filters": {"missing":
 - Make sure lint, format, mypy, and tests all pass.
 - If you add or change behavior, update the README tool table and any relevant env
   vars, and add tests.
-- Don't commit secrets — `.env` is gitignored; pass credentials via the environment.
+- Don't commit secrets — `.env` is gitignored; pass the API key via the environment.

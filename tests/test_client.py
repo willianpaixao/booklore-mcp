@@ -1,4 +1,4 @@
-"""BookLoreClient auth behavior: lazy login, 401 refresh/retry, error handling.
+"""BookOrbitClient behavior: API-key auth, error mapping, retries.
 
 The client is async (httpx.AsyncClient), so these tests are async too; respx
 intercepts the async transport transparently.
@@ -9,122 +9,119 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from server import BookLoreClient, BookLoreError
+from server import BookOrbitClient, BookOrbitError
 
-BASE = "http://booklore.test"
+BASE = "http://bookorbit.test"
+KEY = "bok_" + "k" * 49
 
 
-def _login_route(respx_mock, token="acc1", refresh="ref1"):
-    return respx_mock.post(f"{BASE}/api/v1/auth/login").mock(
-        return_value=httpx.Response(200, json={"accessToken": token, "refreshToken": refresh})
+async def test_api_key_sent_on_every_request(respx_mock):
+    route = respx_mock.get(f"{BASE}/api/v1/auth/me").mock(
+        return_value=httpx.Response(200, json={"username": "ann"})
     )
 
+    client = BookOrbitClient(BASE, KEY)
+    assert await client.get("/api/v1/auth/me") == {"username": "ann"}
+    assert await client.get("/api/v1/auth/me") == {"username": "ann"}
 
-async def test_lazy_login_attaches_bearer(respx_mock):
-    login = _login_route(respx_mock)
-    books = respx_mock.get(f"{BASE}/api/v1/books").mock(return_value=httpx.Response(200, json=[]))
-
-    client = BookLoreClient(BASE, "tester", "secret")
-    assert await client.get("/api/v1/books") == []
-
-    assert login.called
-    assert books.calls.last.request.headers["Authorization"] == "Bearer acc1"
+    assert route.call_count == 2
+    for call in route.calls:
+        assert call.request.headers["X-Api-Key"] == KEY
+        assert "Authorization" not in call.request.headers
 
 
-async def test_401_triggers_refresh_then_retries(respx_mock):
-    _login_route(respx_mock, token="acc1", refresh="ref1")
-    refresh = respx_mock.post(f"{BASE}/api/v1/auth/refresh").mock(
-        return_value=httpx.Response(200, json={"accessToken": "acc2", "refreshToken": "ref2"})
-    )
-    books = respx_mock.get(f"{BASE}/api/v1/books").mock(
-        side_effect=[httpx.Response(401), httpx.Response(200, json=[{"id": 1}])]
-    )
+async def test_caller_headers_cannot_override_api_key(respx_mock):
+    route = respx_mock.get(f"{BASE}/api/v1/auth/me").mock(return_value=httpx.Response(200))
 
-    client = BookLoreClient(BASE, "tester", "secret")
-    assert await client.get("/api/v1/books") == [{"id": 1}]
+    client = BookOrbitClient(BASE, KEY)
+    await client.get("/api/v1/auth/me", headers={"X-Api-Key": "other", "Accept": "x/y"})
 
-    assert refresh.called
-    assert books.calls.last.request.headers["Authorization"] == "Bearer acc2"
+    assert route.calls.last.request.headers["X-Api-Key"] == KEY
+    assert route.calls.last.request.headers["Accept"] == "x/y"
 
 
-async def test_refresh_failure_falls_back_to_relogin(respx_mock):
-    login = respx_mock.post(f"{BASE}/api/v1/auth/login").mock(
-        side_effect=[
-            httpx.Response(200, json={"accessToken": "acc1", "refreshToken": "ref1"}),
-            httpx.Response(200, json={"accessToken": "acc3", "refreshToken": "ref3"}),
-        ]
-    )
-    refresh = respx_mock.post(f"{BASE}/api/v1/auth/refresh").mock(return_value=httpx.Response(401))
-    books = respx_mock.get(f"{BASE}/api/v1/books").mock(
-        side_effect=[httpx.Response(401), httpx.Response(200, json=[])]
+async def test_missing_api_key_raises_without_calling_server(respx_mock):
+    route = respx_mock.get(f"{BASE}/api/v1/auth/me")
+
+    client = BookOrbitClient(BASE, None)
+    with pytest.raises(BookOrbitError, match="BOOKORBIT_API_KEY"):
+        await client.get("/api/v1/auth/me")
+    assert not route.called
+
+
+async def test_401_is_not_retried_and_explains_rejected_key(respx_mock):
+    route = respx_mock.get(f"{BASE}/api/v1/auth/me").mock(
+        return_value=httpx.Response(401, json={"statusCode": 401, "message": "Unauthorized"})
     )
 
-    client = BookLoreClient(BASE, "tester", "secret")
-    assert await client.get("/api/v1/books") == []
-
-    assert refresh.called
-    assert login.call_count == 2
-    assert books.calls.last.request.headers["Authorization"] == "Bearer acc3"
+    client = BookOrbitClient(BASE, KEY, retries=2, backoff=0)
+    with pytest.raises(BookOrbitError, match="API key was rejected"):
+        await client.get("/api/v1/auth/me")
+    assert route.call_count == 1
 
 
-async def test_missing_credentials_raises():
-    client = BookLoreClient(BASE, None, None)
-    with pytest.raises(BookLoreError, match="BOOKLORE_USERNAME"):
-        await client.get("/api/v1/books")
+@pytest.mark.parametrize(
+    ("status", "code", "hint"),
+    [
+        (403, "API_KEY_READ_ONLY", "read-only"),
+        (403, "API_KEY_ROUTE_FORBIDDEN", "does not allow API keys"),
+        (401, "API_KEYS_DISABLED", "turned off"),
+    ],
+)
+async def test_api_key_error_codes_get_hints(respx_mock, status, code, hint):
+    respx_mock.post(f"{BASE}/api/v1/collections").mock(
+        return_value=httpx.Response(status, json={"message": "Forbidden", "errorCode": code})
+    )
+
+    client = BookOrbitClient(BASE, KEY)
+    with pytest.raises(BookOrbitError, match=hint) as excinfo:
+        await client.post("/api/v1/collections", json={"name": "x"})
+    assert f"[{code}]" in str(excinfo.value)
 
 
-async def test_http_error_raises(respx_mock):
-    _login_route(respx_mock)
+async def test_missing_permission_message_is_surfaced(respx_mock):
+    respx_mock.get(f"{BASE}/api/v1/book-dock/summary").mock(
+        return_value=httpx.Response(
+            403, json={"statusCode": 403, "message": "Missing permission: book_dock_access"}
+        )
+    )
+
+    client = BookOrbitClient(BASE, KEY)
+    with pytest.raises(BookOrbitError, match="Missing permission: book_dock_access"):
+        await client.get("/api/v1/book-dock/summary")
+
+
+async def test_non_json_error_raises_with_status(respx_mock):
     respx_mock.get(f"{BASE}/api/v1/books/999").mock(
         return_value=httpx.Response(404, text="not found")
     )
 
-    client = BookLoreClient(BASE, "tester", "secret")
-    with pytest.raises(BookLoreError, match="404"):
+    client = BookOrbitClient(BASE, KEY)
+    with pytest.raises(BookOrbitError, match="404: not found"):
         await client.get("/api/v1/books/999")
 
 
-async def test_timeout_is_wrapped_as_booklore_error(respx_mock):
-    _login_route(respx_mock)
-    respx_mock.get(f"{BASE}/api/v1/books").mock(side_effect=httpx.ReadTimeout("slow"))
+async def test_timeout_is_wrapped_as_bookorbit_error(respx_mock):
+    respx_mock.get(f"{BASE}/api/v1/libraries").mock(side_effect=httpx.ReadTimeout("slow"))
 
-    client = BookLoreClient(BASE, "tester", "secret")
-    with pytest.raises(BookLoreError, match="timed out"):
-        await client.get("/api/v1/books")
+    client = BookOrbitClient(BASE, KEY)
+    with pytest.raises(BookOrbitError, match="timed out"):
+        await client.get("/api/v1/libraries")
 
 
-async def test_transport_error_is_wrapped_as_booklore_error(respx_mock):
-    _login_route(respx_mock)
-    respx_mock.get(f"{BASE}/api/v1/books").mock(side_effect=httpx.ConnectError("refused"))
+async def test_transport_error_is_wrapped_as_bookorbit_error(respx_mock):
+    respx_mock.get(f"{BASE}/api/v1/libraries").mock(side_effect=httpx.ConnectError("refused"))
 
-    client = BookLoreClient(BASE, "tester", "secret")
-    with pytest.raises(BookLoreError, match="Could not reach BookLore"):
-        await client.get("/api/v1/books")
+    client = BookOrbitClient(BASE, KEY)
+    with pytest.raises(BookOrbitError, match="Could not reach BookOrbit"):
+        await client.get("/api/v1/libraries")
 
 
 async def test_retries_transient_5xx_then_succeeds(respx_mock):
-    _login_route(respx_mock)
-    route = respx_mock.get(f"{BASE}/api/v1/books").mock(
+    route = respx_mock.get(f"{BASE}/api/v1/libraries").mock(
         side_effect=[httpx.Response(503), httpx.Response(200, json=[{"id": 1}])]
     )
 
-    client = BookLoreClient(BASE, "tester", "secret", retries=2, backoff=0)
-    assert await client.get("/api/v1/books") == [{"id": 1}]
+    client = BookOrbitClient(BASE, KEY, retries=2, backoff=0)
+    assert await client.get("/api/v1/libraries") == [{"id": 1}]
     assert route.call_count == 2  # one retry after the 503
-
-
-async def test_book_list_cache_served_then_invalidated_on_write(respx_mock):
-    _login_route(respx_mock)
-    books = respx_mock.get(f"{BASE}/api/v1/books").mock(
-        return_value=httpx.Response(200, json=[{"id": 1}])
-    )
-    respx_mock.post(f"{BASE}/api/v1/books/status").mock(return_value=httpx.Response(200, json=[]))
-
-    client = BookLoreClient(BASE, "tester", "secret", cache_ttl=30)
-    await client.get_books()
-    await client.get_books()
-    assert books.call_count == 1  # second call served from cache
-
-    await client.post("/api/v1/books/status", json={"bookIds": [1], "status": "READ"})
-    await client.get_books()
-    assert books.call_count == 2  # write invalidated the cache

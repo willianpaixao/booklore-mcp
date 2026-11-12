@@ -1,14 +1,14 @@
-# BookLore MCP server
+# BookOrbit MCP server
 
 A local [MCP](https://modelcontextprotocol.io) server that wraps a self-hosted
-**BookLore** instance's REST API so Claude can search your library, read and edit
-metadata, manage shelves, and track reading progress.
+[**BookOrbit**](https://github.com/bookorbit/bookorbit) instance's REST API so Claude
+can search your library, read and edit metadata, manage collections, and track
+reading progress.
 
 Runs as a long-lived **HTTP** server (default) or over **stdio** (for local Claude
-launches), and talks to your BookLore over HTTP. Single-user — authenticates with
-your BookLore login (JWT, auto-refreshed).
+launches), and talks to your BookOrbit over HTTP. Single-user — authenticates with
+a BookOrbit [API key](#configure-the-api-key).
 
-## Tools
 
 | Tool | Kind | What it does |
 |---|---|---|
@@ -72,32 +72,40 @@ installs dependencies; `uv run` auto-syncs before running, so you never have to
 activate anything.
 
 ```bash
-cd booklore-mcp
+cd bookorbit-mcp
 uv sync                   # creates .venv, installs fastmcp + httpx
-cp .env.example .env      # then edit with your BookLore URL + credentials
+cp .env.example .env      # then edit with your BookOrbit URL + API key
 ```
 
-## Configure credentials
+## Configure the API key
 
-The server reads three environment variables (see `.env.example`):
+The server authenticates with a BookOrbit API key, sent as `X-Api-Key` on every
+request.
 
-- `BOOKLORE_URL` — your BookLore base URL (default `http://localhost:6060`)
-- `BOOKLORE_USERNAME`
-- `BOOKLORE_PASSWORD`
-- `BOOKLORE_TIMEOUT` — per-request timeout in seconds (default `120`). Metadata
-  writes regenerate covers server-side and can be slow; raise this if you hit
-  timeouts on tags/metadata updates.
-- `BOOKLORE_RETRIES` — retries for transient failures (timeouts, 429/5xx) with
-  exponential backoff (default `2`); `BOOKLORE_BACKOFF` sets the base delay in
+1. In BookOrbit, open **Settings > You > API keys**. Creating keys needs the
+   **Create API keys** permission, which an administrator can grant.
+2. Create a key for this server:
+   - **Access:** **Read** is enough for the read tools. The write tools need
+     **Read and write**.
+   - **Permissions:** grant only what the tools you use need, for example
+     `library_edit_metadata` for metadata edits. A key with no permissions can still
+     read your libraries.
+   - **Libraries:** optionally limit the key to the libraries it should touch.
+   - **Expires:** prefer an expiry, and regenerate the key on a schedule.
+3. Copy the key (it is shown once and starts with `bok_`) into `BOOKORBIT_API_KEY`.
+
+Keep the key in `.env` or a secret store, never in source control. The `ping` tool
+reports whether the key works and which permissions it actually has.
+
+The server reads these environment variables (see `.env.example`):
+
+- `BOOKORBIT_URL` — your BookOrbit base URL (default `http://localhost:3000`)
+- `BOOKORBIT_API_KEY` — your BookOrbit API key (required)
+- `BOOKORBIT_TIMEOUT` — per-request timeout in seconds (default `120`). Raise
+  this if you hit timeouts on large operations.
+- `BOOKORBIT_RETRIES` — retries for transient failures (timeouts, 429/5xx) with
+  exponential backoff (default `2`); `BOOKORBIT_BACKOFF` sets the base delay in
   seconds (default `0.5`).
-- `BOOKLORE_CACHE_TTL` — seconds to cache the full book list, shared by the
-  search/stats/export tools (default `10`; `0` disables). Any write to a book
-  invalidates it immediately.
-- `BOOKLORE_BULK_CONCURRENCY` — max concurrent per-book operations in
-  `bulk_update_metadata` (default `1`, i.e. sequential). BookLore stores tags and
-  categories as shared rows with a unique name, so adding the *same* new tag to
-  several books in parallel causes a data-conflict (HTTP 400). Raise this only when
-  your per-book patches don't introduce the same new tags/categories.
 
 ## Logging
 
@@ -128,11 +136,11 @@ uv run server.py
 ```
 
 Serves streamable-HTTP MCP at `http://127.0.0.1:8000/mcp`. Override with
-`MCP_HOST`, `MCP_PORT`, `MCP_PATH`. Press Ctrl-C to stop. `uv run booklore-mcp`
+`MCP_HOST`, `MCP_PORT`, `MCP_PATH`. Press Ctrl-C to stop. `uv run bookorbit-mcp`
 (the installed console script) is equivalent to `uv run server.py`.
 
-> **Security:** this endpoint has no auth of its own and acts with your BookLore
-> credentials, so anyone who can reach the port controls your library. Keep it
+> **Security:** this endpoint has no auth of its own and acts with your API key, so
+> anyone who can reach the port can do whatever the key allows. Keep it
 > bound to `127.0.0.1` (the default). Only set `MCP_HOST=0.0.0.0` behind a
 > reverse proxy that adds TLS + authentication.
 
@@ -149,23 +157,22 @@ this is the form an MCP host launches directly (see Claude Code/Desktop below).
 ## Run with Docker
 
 The image runs the HTTP transport bound to `0.0.0.0` inside the container; you
-control exposure with the published port. Credentials are passed in at runtime, so
-they're never baked into the image.
+control exposure with the published port. The API key is passed in at runtime, so
+it's never baked into the image.
 
 ```bash
-docker build -t booklore-mcp .
-docker run --rm --env-file .env -p 127.0.0.1:8000:8000 booklore-mcp
+docker build -t bookorbit-mcp .
+docker run --rm --env-file .env -p 127.0.0.1:8000:8000 bookorbit-mcp
 ```
 
-`--env-file .env` loads your credentials from the `.env` file (same one from
-[Configure credentials](#configure-credentials)) — each `KEY=value` line becomes an
+`--env-file .env` loads your API key from the `.env` file (same one from
+[Configure the API key](#configure-the-api-key)) — each `KEY=value` line becomes an
 environment variable in the container:
 
 ```bash
 # .env
-BOOKLORE_URL=http://host.docker.internal:6060
-BOOKLORE_USERNAME=you
-BOOKLORE_PASSWORD=secret
+BOOKORBIT_URL=http://host.docker.internal:3000
+BOOKORBIT_API_KEY=bok_...
 ```
 
 The path is relative to where you run the command (`--env-file ./path/to/.env` for
@@ -173,17 +180,16 @@ another location). To pass variables individually instead of a file, use `-e`:
 
 ```bash
 docker run --rm \
-  -e BOOKLORE_URL=http://host.docker.internal:6060 \
-  -e BOOKLORE_USERNAME=you \
-  -e BOOKLORE_PASSWORD=secret \
-  -p 127.0.0.1:8000:8000 booklore-mcp
+  -e BOOKORBIT_URL=http://host.docker.internal:3000 \
+  -e BOOKORBIT_API_KEY=bok_... \
+  -p 127.0.0.1:8000:8000 bookorbit-mcp
 ```
 
 The MCP endpoint is served at `http://127.0.0.1:8000/mcp`.
 
 > **Security:** the publish mapping above binds to `127.0.0.1` on purpose — the
-> endpoint has no auth of its own and acts with your BookLore credentials. If your
-> BookLore runs in its own container, point `BOOKLORE_URL` at it over a shared Docker
+> endpoint has no auth of its own and acts with your API key. If your
+> BookOrbit runs in its own container, point `BOOKORBIT_URL` at it over a shared Docker
 > network (or `host.docker.internal`) rather than `localhost`. Only expose the port
 > beyond loopback behind a reverse proxy that adds TLS + authentication.
 
@@ -214,19 +220,18 @@ commands also accept a URL (e.g. `http://127.0.0.1:8000/mcp`) instead of
 then connect to it:
 
 ```bash
-claude mcp add --transport http booklore http://127.0.0.1:8000/mcp
+claude mcp add --transport http bookorbit http://127.0.0.1:8000/mcp
 ```
 
 **Local (stdio)** — Claude launches the process itself (note `MCP_TRANSPORT=stdio`):
 
 ```bash
-claude mcp add booklore \
+claude mcp add bookorbit \
   --scope user \
   --env MCP_TRANSPORT=stdio \
-  --env BOOKLORE_URL=http://localhost:6060 \
-  --env BOOKLORE_USERNAME=you \
-  --env BOOKLORE_PASSWORD=secret \
-  -- uv --directory /absolute/path/to/booklore-mcp run server.py
+  --env BOOKORBIT_URL=http://localhost:3000 \
+  --env BOOKORBIT_API_KEY=bok_... \
+  -- uv --directory /absolute/path/to/bookorbit-mcp run server.py
 ```
 
 `uv --directory <path> run` resolves the project's environment automatically, so
@@ -241,14 +246,13 @@ Edit Config):
 ```json
 {
   "mcpServers": {
-    "booklore": {
+    "bookorbit": {
       "command": "uv",
-      "args": ["--directory", "/abs/path/to/booklore-mcp", "run", "server.py"],
+      "args": ["--directory", "/abs/path/to/bookorbit-mcp", "run", "server.py"],
       "env": {
         "MCP_TRANSPORT": "stdio",
-        "BOOKLORE_URL": "http://localhost:6060",
-        "BOOKLORE_USERNAME": "you",
-        "BOOKLORE_PASSWORD": "secret"
+        "BOOKORBIT_URL": "http://localhost:3000",
+        "BOOKORBIT_API_KEY": "bok_..."
       }
     }
   }
@@ -270,15 +274,14 @@ uvx mcpo --port 9000 --server-type streamable-http -- http://127.0.0.1:8000/mcp
 ```
 
 Or let `mcpo` launch and manage the server itself over stdio (no separate process
-to run — pass the BookLore env through with `-e`):
+to run — pass the BookOrbit env through with `-e`):
 
 ```bash
 uvx mcpo --port 9000 \
   -e MCP_TRANSPORT=stdio \
-  -e BOOKLORE_URL=http://localhost:6060 \
-  -e BOOKLORE_USERNAME=you \
-  -e BOOKLORE_PASSWORD=secret \
-  -- uv --directory /abs/path/to/booklore-mcp run server.py
+  -e BOOKORBIT_URL=http://localhost:3000 \
+  -e BOOKORBIT_API_KEY=bok_... \
+  -- uv --directory /abs/path/to/bookorbit-mcp run server.py
 ```
 
 Then in Open WebUI add an OpenAPI tool server pointing at the proxy
@@ -296,7 +299,7 @@ behind a reverse proxy that adds TLS and authentication.
 ## Development
 
 `uv sync` installs the dev tooling (pytest, respx, ruff) from the `dev` dependency
-group. The test suite is fully offline — `respx` mocks the BookLore API, so no live
+group. The test suite is fully offline — `respx` mocks the BookOrbit API, so no live
 instance is needed.
 
 ```bash

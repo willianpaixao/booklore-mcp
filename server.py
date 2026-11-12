@@ -1,12 +1,12 @@
-"""BookLore MCP server.
+"""BookOrbit MCP server.
 
-Wraps a self-hosted BookLore instance's REST API (`/api/v1/...`) so Claude can
-search your library, read and edit metadata, manage shelves, and track reading
-progress. Runs on your machine and talks to your BookLore over HTTP; serves MCP
+Wraps a self-hosted BookOrbit instance's REST API (`/api/v1/...`) so Claude can
+search your library, read and edit metadata, manage collections, and track reading
+progress. Runs on your machine and talks to your BookOrbit over HTTP; serves MCP
 over HTTP (default) or stdio, selected with MCP_TRANSPORT.
 
-Auth: logs in with BOOKLORE_USERNAME / BOOKLORE_PASSWORD to obtain a JWT access
-+ refresh token pair, attaches `Authorization: Bearer`, and refreshes on 401.
+Auth: a BookOrbit API key (BOOKORBIT_API_KEY), sent as `X-Api-Key` on every
+request. Create one under Settings > You > API keys.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import io
 import json
 import os
 import re
-import time
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -32,25 +31,16 @@ from log import configure_logging, get_logger
 
 # --- Configuration (from environment) --------------------------------------
 
-BASE_URL = os.environ.get("BOOKLORE_URL", "http://localhost:6060").rstrip("/")
-USERNAME = os.environ.get("BOOKLORE_USERNAME")
-PASSWORD = os.environ.get("BOOKLORE_PASSWORD")
+BASE_URL = os.environ.get("BOOKORBIT_URL", "http://localhost:3000").rstrip("/")
+API_KEY = os.environ.get("BOOKORBIT_API_KEY", "").strip() or None
 # Per-request timeout (seconds). Metadata writes regenerate covers server-side and
-# can be slow, so default generously; override with BOOKLORE_TIMEOUT.
-TIMEOUT = float(os.environ.get("BOOKLORE_TIMEOUT", "120"))
+# can be slow, so default generously; override with BOOKORBIT_TIMEOUT.
+TIMEOUT = float(os.environ.get("BOOKORBIT_TIMEOUT", "120"))
 # Retries (with exponential backoff) for transient failures: timeouts and 429/5xx.
-RETRIES = int(os.environ.get("BOOKLORE_RETRIES", "2"))
-BACKOFF = float(os.environ.get("BOOKLORE_BACKOFF", "0.5"))
-# Seconds to cache the full book list (shared by the search/stats/export tools);
-# 0 disables caching. Any write to /api/v1/books invalidates it immediately.
-CACHE_TTL = float(os.environ.get("BOOKLORE_CACHE_TTL", "10"))
-# Max concurrent per-book operations in bulk_update_metadata. Defaults to 1
-# (sequential): BookLore stores tags/categories as shared rows with a UNIQUE name,
-# so concurrently adding the SAME new tag to several books trips a data-conflict
-# (HTTP 400). Raise this only when per-book patches don't share new tags/categories.
-BULK_CONCURRENCY = int(os.environ.get("BOOKLORE_BULK_CONCURRENCY", "1"))
+RETRIES = int(os.environ.get("BOOKORBIT_RETRIES", "2"))
+BACKOFF = float(os.environ.get("BOOKORBIT_BACKOFF", "0.5"))
 
-log = get_logger("booklore")
+log = get_logger("bookorbit")
 
 ReadStatus = Literal[
     "UNREAD",
@@ -65,11 +55,11 @@ ReadStatus = Literal[
 ]
 
 
-# --- BookLore HTTP client (JWT login + refresh) -----------------------------
+# --- BookOrbit HTTP client (API key) ----------------------------------------
 
 
-class BookLoreError(ToolError):
-    """Raised when the BookLore API returns an error or auth is misconfigured.
+class BookOrbitError(ToolError):
+    """Raised when the BookOrbit API returns an error or auth is misconfigured.
 
     Subclasses FastMCP's ToolError so the message is treated as intentional,
     client-facing detail (and survives if mask_error_details is ever enabled).
@@ -79,46 +69,67 @@ class BookLoreError(ToolError):
 # HTTP statuses that warrant a transient retry (rate limit + gateway/unavailable).
 _RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
 
+# Actionable hints for BookOrbit's API-key error codes (docs/API_KEYS.md upstream).
+_ERROR_HINTS = {
+    "API_KEY_READ_ONLY": "This API key is read-only; use a 'Read and write' key for write tools.",
+    "API_KEY_ROUTE_FORBIDDEN": "BookOrbit does not allow API keys on this route.",
+    "API_KEYS_DISABLED": "API keys are turned off on this BookOrbit server "
+    "(Settings > Admin > API keys).",
+}
 
-class BookLoreClient:
-    """Thin authenticated wrapper over the BookLore REST API.
 
-    Logs in lazily on first use. Transparently refreshes the access token on a
-    401, falling back to a full re-login if the refresh token is also stale.
+def _api_error(method: str, path: str, resp: httpx.Response) -> BookOrbitError:
+    """Build a BookOrbitError from an error response, surfacing BookOrbit's
+    `errorCode` and `message` (which names a missing permission on 403s)."""
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        return BookOrbitError(f"{method} {path} -> {resp.status_code}: {resp.text}")
+
+    code = body.get("errorCode")
+    message = body.get("message")
+    if isinstance(message, list):  # validation errors may arrive as a list
+        message = "; ".join(str(m) for m in message)
+    hint = _ERROR_HINTS.get(code) if isinstance(code, str) else None
+    if hint is None and resp.status_code == 401:
+        hint = "The API key was rejected: it is unknown, expired, revoked or malformed."
+    parts = [f"{method} {path} -> {resp.status_code}"]
+    if code:
+        parts.append(f"[{code}]")
+    detail = f"{' '.join(parts)}: {message or resp.reason_phrase}"
+    return BookOrbitError(f"{detail}. {hint}" if hint else detail)
+
+
+class BookOrbitClient:
+    """Thin wrapper over the BookOrbit REST API, authenticated with an API key.
+
+    The key is sent as `X-Api-Key` on every request. There is no session to log
+    in to or refresh: a 401 means the key itself was rejected.
     """
 
     def __init__(
         self,
         base_url: str,
-        username: str | None,
-        password: str | None,
+        api_key: str | None,
         timeout: float = 60.0,
         retries: int = 0,
         backoff: float = 0.5,
-        cache_ttl: float = 0.0,
     ):
         self._base_url = base_url
-        self._username = username
-        self._password = password
+        self._api_key = api_key
         self._timeout = timeout
         self._retries = max(0, retries)
         self._backoff = backoff
-        self._cache_ttl = cache_ttl
-        self._access_token: str | None = None
-        self._refresh_token: str | None = None
         self._http = httpx.AsyncClient(base_url=base_url, timeout=timeout)
-        # Serializes login/refresh so concurrent tool calls can't race on the
-        # token pair (e.g. two requests 401'ing at once and double-logging-in).
-        self._auth_lock = asyncio.Lock()
-        # Short-TTL cache of the full book list, keyed by with_description.
-        self._books_cache: dict[bool, tuple[float, list[dict]]] = {}
 
-    # -- transport (retry + wrap httpx errors as BookLoreError) --------------
+    # -- transport (retry + wrap httpx errors as BookOrbitError) --------------
 
     async def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         """Send a request, retrying transient failures (timeouts, connection
         errors, 429/5xx) with exponential backoff, and translating persistent
-        httpx transport/timeout failures into a clean BookLoreError."""
+        httpx transport/timeout failures into a clean BookOrbitError."""
         attempt = 0
         while True:
             try:
@@ -136,13 +147,12 @@ class BookLoreClient:
                     await asyncio.sleep(self._backoff * (2 ** (attempt - 1)))
                     continue
                 if isinstance(exc, httpx.TimeoutException):
-                    raise BookLoreError(
-                        f"{method} {path} timed out after {self._timeout}s. BookLore can "
-                        f"be slow on metadata writes (cover regeneration) — raise "
-                        f"BOOKLORE_TIMEOUT."
+                    raise BookOrbitError(
+                        f"{method} {path} timed out after {self._timeout}s. Raise "
+                        f"BOOKORBIT_TIMEOUT if this server is slow on large operations."
                     ) from exc
-                raise BookLoreError(
-                    f"Could not reach BookLore at {self._base_url} ({method} {path}): {exc}"
+                raise BookOrbitError(
+                    f"Could not reach BookOrbit at {self._base_url} ({method} {path}): {exc}"
                 ) from exc
 
             if resp.status_code in _RETRYABLE_STATUS and attempt < self._retries:
@@ -160,85 +170,28 @@ class BookLoreClient:
 
     # -- auth ----------------------------------------------------------------
 
-    async def _login(self) -> None:
-        if not self._username or not self._password:
-            raise BookLoreError(
-                "BOOKLORE_USERNAME and BOOKLORE_PASSWORD must be set in the "
-                "environment for the BookLore MCP server to authenticate."
+    def auth_headers(self) -> dict[str, str]:
+        """Headers that authenticate a request, for calls that bypass `request()`
+        (e.g. streaming). Raises if no API key is configured."""
+        if not self._api_key:
+            raise BookOrbitError(
+                "BOOKORBIT_API_KEY must be set in the environment for the BookOrbit "
+                "MCP server to authenticate. Create a key in BookOrbit under "
+                "Settings > You > API keys."
             )
-        resp = await self._send(
-            "POST",
-            "/api/v1/auth/login",
-            json={"username": self._username, "password": self._password},
-        )
-        if resp.status_code != 200:
-            raise BookLoreError(f"Login failed ({resp.status_code}): {resp.text}")
-        data = resp.json()
-        self._access_token = data["accessToken"]
-        self._refresh_token = data["refreshToken"]
-        log.info("authenticated with booklore", user=self._username)
+        return {"X-Api-Key": self._api_key}
 
-    async def _refresh(self) -> bool:
-        """Try to refresh the access token. Returns True on success."""
-        if not self._refresh_token:
-            return False
-        resp = await self._send(
-            "POST", "/api/v1/auth/refresh", json={"refreshToken": self._refresh_token}
-        )
-        if resp.status_code != 200:
-            log.warning("token refresh failed, will re-login", status=resp.status_code)
-            return False
-        data = resp.json()
-        self._access_token = data["accessToken"]
-        self._refresh_token = data["refreshToken"]
-        log.debug("refreshed access token")
-        return True
-
-    async def _ensure_token(self) -> str:
-        """Return a valid access token, logging in lazily on first use."""
-        if self._access_token is None:
-            async with self._auth_lock:
-                if self._access_token is None:  # double-checked under the lock
-                    await self._login()
-        return self._access_token  # type: ignore[return-value]
-
-    async def _reauthenticate(self, stale_token: str | None) -> None:
-        """Refresh (or re-login) after a 401, once per stale token.
-
-        `stale_token` is the token whose request just 401'd. If another task
-        already rotated it while we waited for the lock, we reuse their result
-        instead of logging in a second time.
-        """
-        async with self._auth_lock:
-            if self._access_token != stale_token:
-                return
-            if not await self._refresh():
-                await self._login()
-
-    # -- request with one auth retry ----------------------------------------
+    # -- requests --------------------------------------------------------------
 
     async def request(self, method: str, path: str, **kwargs: Any) -> Any:
-        caller_headers = kwargs.pop("headers", {})
-        token = await self._ensure_token()
-        headers = {**caller_headers, "Authorization": f"Bearer {token}"}
+        headers = {**kwargs.pop("headers", {}), **self.auth_headers()}
         resp = await self._send(method, path, headers=headers, **kwargs)
 
-        if resp.status_code == 401:
-            # Access token expired — refresh (or re-login) and retry once.
-            log.info("access token rejected, re-authenticating", method=method, path=path)
-            await self._reauthenticate(token)
-            headers = {**caller_headers, "Authorization": f"Bearer {self._access_token}"}
-            resp = await self._send(method, path, headers=headers, **kwargs)
-
         if resp.status_code >= 400:
-            log.warning("booklore api error", method=method, path=path, status=resp.status_code)
-            raise BookLoreError(f"{method} {path} -> {resp.status_code}: {resp.text}")
+            log.warning("bookorbit api error", method=method, path=path, status=resp.status_code)
+            raise _api_error(method, path, resp)
 
-        # A successful write to /books may change the cached list — drop it.
-        if method != "GET" and path.startswith("/api/v1/books") and self._books_cache:
-            self._books_cache.clear()
-
-        log.debug("booklore request", method=method, path=path, status=resp.status_code)
+        log.debug("bookorbit request", method=method, path=path, status=resp.status_code)
         if resp.status_code == 204 or not resp.content:
             return None
         ctype = resp.headers.get("content-type", "")
@@ -257,35 +210,29 @@ class BookLoreClient:
         return await self.request("DELETE", path, **kw)
 
     async def get_books(self, with_description: bool = False) -> list[dict]:
-        """Fetch the full book list, served from a short-TTL cache when enabled.
-        The cache is invalidated automatically on any write to /api/v1/books."""
-        if self._cache_ttl > 0:
-            hit = self._books_cache.get(with_description)
-            if hit and time.monotonic() - hit[0] < self._cache_ttl:
-                return hit[1]
-        books = (
+        """Fetch the full book list (BookLore's `GET /books`).
+
+        BookOrbit has no list-everything route; Phase 1 of ROADMAP.md replaces
+        this with paged `POST /books/query` calls.
+        """
+        return (
             await self.get(
                 "/api/v1/books", params={"withDescription": str(with_description).lower()}
             )
             or []
         )
-        if self._cache_ttl > 0:
-            self._books_cache[with_description] = (time.monotonic(), books)
-        return books
 
     async def close(self) -> None:
         """Close the underlying HTTP connection pool."""
         await self._http.aclose()
 
 
-client = BookLoreClient(
+client = BookOrbitClient(
     BASE_URL,
-    USERNAME,
-    PASSWORD,
+    API_KEY,
     timeout=TIMEOUT,
     retries=RETRIES,
     backoff=BACKOFF,
-    cache_ttl=CACHE_TTL,
 )
 
 
@@ -552,7 +499,7 @@ async def _app_settings() -> dict | None:
     """Best-effort read of the full app settings (provider enablement, Amazon cookie,
     provider-specific field toggles). Returns None when the endpoint is unavailable
     (e.g. permission denied), so callers degrade to result-only status rather than fail."""
-    with suppress(BookLoreError):
+    with suppress(BookOrbitError):
         settings = await client.get("/api/v1/settings")
         if isinstance(settings, dict):
             return settings
@@ -631,7 +578,7 @@ def _validate_clear_fields(clear_fields: list[str] | None) -> None:
     """Reject clearFlag names BookLore won't accept, with a helpful message."""
     bad = sorted(set(clear_fields or []) - _CLEARABLE_FIELDS)
     if bad:
-        raise BookLoreError(
+        raise BookOrbitError(
             f"Cannot clear unknown field(s): {', '.join(bad)}. "
             f"Clearable fields: {', '.join(sorted(_CLEARABLE_FIELDS))}."
         )
@@ -676,10 +623,10 @@ async def lifespan(_server: FastMCP) -> AsyncIterator[None]:
 
 
 mcp = FastMCP(
-    name="booklore",
+    name="bookorbit",
     lifespan=lifespan,
     instructions=(
-        "Tools for a self-hosted BookLore library. Book and shelf IDs are not "
+        "Tools for a self-hosted BookOrbit library. Book and shelf IDs are not "
         "guessable — use list_books / list_shelves to discover them before "
         "calling tools that take an ID. list_books returns trimmed summaries; "
         "call get_book for the full record including metadata. To set reading "
@@ -1050,7 +997,7 @@ async def export_library(
     if fields:
         bad = sorted(set(fields) - set(_EXPORT_FIELDS))
         if bad:
-            raise BookLoreError(
+            raise BookOrbitError(
                 f"Unknown export field(s): {', '.join(bad)}. "
                 f"Available: {', '.join(_EXPORT_FIELDS)}."
             )
@@ -1099,35 +1046,46 @@ async def export_library(
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True, "title": "Ping / whoami"})
 async def ping() -> dict:
     """Liveness + auth probe. `ok` false means the server is unreachable; ok=true with
-    authenticated=false means reachable but the login was rejected or credentials are
-    unset — so the client can tell "down" from "logged out" before a long batch.
+    authenticated=false means it is up but the API key is missing or was rejected, so
+    the client can tell "down" from "bad key" before a long batch.
 
-    Reachability + version come from the unauthenticated /healthcheck; user,
-    book_count and library_count are added once authenticated.
+    Once authenticated, also reports the server version, the key's owner and its
+    effective permissions (a key can hold fewer than its owner), and library and
+    book counts.
     """
     result: dict[str, Any] = {"ok": False, "authenticated": False}
 
-    # Unauthenticated liveness probe — distinguishes "down" from "logged out".
+    # Public liveness probe: no credential needed.
     try:
-        health = (await client._http.get("/api/v1/healthcheck")).json()
-    except Exception as exc:  # transport-level failure
+        health = (await client._http.get("/api/v1/health")).json()
+    except Exception as exc:  # transport-level failure or non-JSON reply
         result["error"] = str(exc)
         return result
-    result["ok"] = True
-    payload = health.get("data") if isinstance(health, dict) else None
-    version = (payload or health or {}).get("version")
-    if version:
-        result["server_version"] = version
+    result["ok"] = isinstance(health, dict) and health.get("status") == "ok"
+    if not result["ok"]:
+        result["error"] = f"health check reported: {health}"
+        return result
 
-    # Auth probe.
     try:
-        books = await client.get("/api/v1/books", params={"withDescription": "false"})
-    except BookLoreError as exc:
+        me = await client.get("/api/v1/auth/me")
+    except BookOrbitError as exc:
         result["error"] = str(exc)
         return result
-    result.update(authenticated=True, user=USERNAME, book_count=len(books or []))
-    with suppress(BookLoreError):
+    result.update(
+        authenticated=True,
+        user=me.get("username"),
+        authentication_method=me.get("authenticationMethod"),
+        permissions=me.get("permissions") or [],
+    )
+    with suppress(BookOrbitError):
+        info = await client.get("/api/v1/app-info")
+        result["server_version"] = info.get("version")
+        if info.get("updateAvailable"):
+            result["latest_version"] = info.get("latestVersion")
+    with suppress(BookOrbitError):
         result["library_count"] = len(await client.get("/api/v1/libraries") or [])
+    with suppress(BookOrbitError):
+        result["book_count"] = (await client.get("/api/v1/statistics/summary"))["totalBooks"]
     return result
 
 
@@ -1155,42 +1113,29 @@ async def bulk_update_metadata(
     fails the batch. Returns {updated:[ids], failed:[{book_id,error}], books:[records]}.
     """
     if items and (book_ids or patch):
-        raise BookLoreError("Pass either book_ids+patch OR items, not both.")
+        raise BookOrbitError("Pass either book_ids+patch OR items, not both.")
     if not items and not (book_ids and patch):
-        raise BookLoreError("Provide book_ids+patch, or items.")
+        raise BookOrbitError("Provide book_ids+patch, or items.")
 
     work = items if items else [{"book_id": bid, "patch": patch} for bid in (book_ids or [])]
-    semaphore = asyncio.Semaphore(BULK_CONCURRENCY)
     total = len(work)
-    done = 0
-
-    async def _one(entry: dict) -> tuple[Any, Any, dict | None]:
-        nonlocal done
-        bid = entry.get("book_id")
-        async with semaphore:
-            try:
-                if not isinstance(bid, int):
-                    raise BookLoreError("each item needs an integer 'book_id'")
-                return bid, await _apply_patch(bid, entry.get("patch") or {}), None
-            except Exception as exc:
-                return bid, None, {"book_id": bid, "error": str(exc)}
-            finally:
-                # Report as each book finishes (success or failure); tasks run
-                # concurrently, so progress need not arrive in input order.
-                done += 1
-                if ctx is not None:
-                    await ctx.report_progress(progress=done, total=total)
 
     updated: list[int] = []
     failed: list[dict] = []
     books: list[dict] = []
-    # gather preserves input order, so results stay aligned with `work`.
-    for bid, book, error in await asyncio.gather(*(_one(e) for e in work)):
-        if error is not None:
-            failed.append(error)
-        else:
+    # Sequential on purpose: ROADMAP.md Phase 4 replaces this per-book loop with
+    # BookOrbit's native bulk endpoints.
+    for done, entry in enumerate(work, start=1):
+        bid = entry.get("book_id")
+        try:
+            if not isinstance(bid, int):
+                raise BookOrbitError("each item needs an integer 'book_id'")
+            books.append(await _apply_patch(bid, entry.get("patch") or {}))
             updated.append(bid)
-            books.append(book)
+        except Exception as exc:
+            failed.append({"book_id": bid, "error": str(exc)})
+        if ctx is not None:
+            await ctx.report_progress(progress=done, total=total)
     return {"updated": updated, "failed": failed, "books": books}
 
 
@@ -1238,7 +1183,7 @@ async def set_field_locks(
     for field in unlock or []:
         field_actions[field if field.endswith("Locked") else f"{field}Locked"] = "UNLOCK"
     if not field_actions:
-        raise BookLoreError("Provide at least one field in `lock` or `unlock`.")
+        raise BookOrbitError("Provide at least one field in `lock` or `unlock`.")
     return await client.put(
         "/api/v1/books/metadata/toggle-field-locks",
         json={"bookIds": book_ids, "fieldActions": field_actions},
@@ -1284,7 +1229,7 @@ async def fetch_metadata_candidates(
     # alone yields nothing useful.
     query = {"isbn": isbn, "title": title, "author": author}
     if not any(query.values()):
-        with suppress(BookLoreError):
+        with suppress(BookOrbitError):
             book = await client.get(f"/api/v1/books/{book_id}", params={"withDescription": "false"})
             meta = book.get("metadata") or {}
             names = _author_names(meta)
@@ -1294,7 +1239,7 @@ async def fetch_metadata_candidates(
                 "author": names[0] if names else None,
             }
 
-    token = await client._ensure_token()
+    auth = client.auth_headers()
     body = {"bookId": book_id, "providers": provs, **query}
 
     candidates: list[dict] = []
@@ -1303,12 +1248,12 @@ async def fetch_metadata_candidates(
             "POST",
             f"/api/v1/books/{book_id}/metadata/prospective",
             json=body,
-            headers={"Authorization": f"Bearer {token}", "Accept": "text/event-stream"},
+            headers={**auth, "Accept": "text/event-stream"},
             timeout=180.0,
         ) as resp:
             if resp.status_code >= 400:
                 detail = (await resp.aread()).decode("utf-8", "replace")
-                raise BookLoreError(f"prospective metadata -> {resp.status_code}: {detail}")
+                raise BookOrbitError(f"prospective metadata -> {resp.status_code}: {detail}")
             async for line in resp.aiter_lines():
                 if line.startswith("data:"):
                     payload = line[len("data:") :].strip()
@@ -1316,7 +1261,7 @@ async def fetch_metadata_candidates(
                         with suppress(json.JSONDecodeError):
                             candidates.append(json.loads(payload))
     except httpx.TimeoutException as exc:
-        raise BookLoreError(
+        raise BookOrbitError(
             f"Fetching candidates for book {book_id} timed out — external providers "
             f"can be slow. Try fewer providers or retry."
         ) from exc
@@ -1476,7 +1421,7 @@ async def find_duplicates(
     if signals:
         bad = sorted(set(signals) - set(_DUP_SIGNALS))
         if bad:
-            raise BookLoreError(
+            raise BookOrbitError(
                 f"Unknown duplicate signal(s): {', '.join(bad)}. Valid: {', '.join(_DUP_SIGNALS)}."
             )
         flags.update({k: bool(v) for k, v in signals.items()})
@@ -1619,19 +1564,19 @@ def main() -> None:
     configure_logging()
     transport = os.environ.get("MCP_TRANSPORT", "http")
     if transport == "stdio":
-        log.info("starting booklore mcp server", transport="stdio", booklore_url=BASE_URL)
+        log.info("starting bookorbit mcp server", transport="stdio", bookorbit_url=BASE_URL)
         mcp.run()  # stdio
     else:
         host = os.environ.get("MCP_HOST", "127.0.0.1")
         port = int(os.environ.get("MCP_PORT", "8000"))
         path = os.environ.get("MCP_PATH", "/mcp")
         log.info(
-            "starting booklore mcp server",
+            "starting bookorbit mcp server",
             transport="http",
             host=host,
             port=port,
             path=path,
-            booklore_url=BASE_URL,
+            bookorbit_url=BASE_URL,
         )
         mcp.run(transport="http", host=host, port=port, path=path)
 

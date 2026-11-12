@@ -159,7 +159,7 @@ wheels = [
 ]
 
 [[package]]
-name = "booklore-mcp"
+name = "bookorbit-mcp"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

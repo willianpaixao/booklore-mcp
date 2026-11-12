@@ -33,7 +33,7 @@ ENV MCP_TRANSPORT=http \
     MCP_HOST=0.0.0.0 \
     MCP_PORT=8000 \
     MCP_PATH=/mcp \
-    BOOKLORE_URL=http://localhost:6060 \
+    BOOKORBIT_URL=http://localhost:3000 \
     LOG_LEVEL=INFO \
     LOG_FORMAT=json
 
@@ -43,5 +43,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import os,socket; socket.create_connection(('127.0.0.1', int(os.environ.get('MCP_PORT','8000'))), timeout=3)" || exit 1
 
-# Credentials are supplied at runtime (docker run --env-file .env).
-CMD ["booklore-mcp"]
+# The API key is supplied at runtime (docker run --env-file .env).
+CMD ["bookorbit-mcp"]

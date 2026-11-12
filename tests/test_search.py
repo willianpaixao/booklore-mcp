@@ -5,12 +5,11 @@ from __future__ import annotations
 import json
 
 import httpx
-import pytest
 from fastmcp import Client
 
 import server
 
-BASE = "http://booklore.test"
+BASE = "http://bookorbit.test"
 
 
 # --- pure helper unit tests (no I/O) ----------------------------------------
@@ -78,15 +77,6 @@ def test_matches_query_over_title_and_authors():
 # --- tool flows -------------------------------------------------------------
 
 
-@pytest.fixture
-def authed(respx_mock):
-    respx_mock.post(f"{BASE}/api/v1/auth/login").mock(
-        return_value=httpx.Response(200, json={"accessToken": "a", "refreshToken": "r"})
-    )
-    server.client = server.BookLoreClient(BASE, "tester", "secret")
-    return respx_mock
-
-
 _BOOKS = [
     {"id": 1, "title": "Tagged", "libraryId": 1, "metadata": {"tags": ["x"], "authors": ["Ann"]}},
     {"id": 2, "title": "Untagged", "libraryId": 1, "metadata": {"tags": [], "authors": ["Bob"]}},
@@ -136,21 +126,59 @@ async def test_bulk_update_reports_partial_success(authed):
     assert data["failed"][0]["book_id"] == 999
 
 
-async def test_ping_reports_authenticated_with_version_and_libraries(authed):
-    authed.get(f"{BASE}/api/v1/healthcheck").mock(
-        return_value=httpx.Response(200, json={"data": {"version": "1.2.3"}})
+async def test_ping_reports_identity_version_and_counts(authed):
+    authed.get(f"{BASE}/api/v1/health").mock(
+        return_value=httpx.Response(200, json={"status": "ok"})
     )
-    authed.get(f"{BASE}/api/v1/books").mock(return_value=httpx.Response(200, json=_BOOKS))
+    me = authed.get(f"{BASE}/api/v1/auth/me").mock(
+        return_value=httpx.Response(
+            200,
+            json={"username": "ann", "authenticationMethod": "api_key", "permissions": ["x"]},
+        )
+    )
+    authed.get(f"{BASE}/api/v1/app-info").mock(
+        return_value=httpx.Response(200, json={"version": "v3.8.0", "updateAvailable": False})
+    )
     authed.get(f"{BASE}/api/v1/libraries").mock(return_value=httpx.Response(200, json=[{"id": 1}]))
+    authed.get(f"{BASE}/api/v1/statistics/summary").mock(
+        return_value=httpx.Response(200, json={"totalBooks": 433})
+    )
 
     async with Client(server.mcp) as c:
         result = await c.call_tool("ping", {})
 
     d = result.data
     assert d["ok"] is True and d["authenticated"] is True
-    assert d["book_count"] == 2
-    assert d["server_version"] == "1.2.3"
-    assert d["library_count"] == 1
+    assert d["user"] == "ann" and d["authentication_method"] == "api_key"
+    assert d["permissions"] == ["x"]
+    assert d["server_version"] == "v3.8.0" and "latest_version" not in d
+    assert d["library_count"] == 1 and d["book_count"] == 433
+    assert me.calls.last.request.headers["X-Api-Key"].startswith("bok_")
+
+
+async def test_ping_up_but_key_rejected(authed):
+    authed.get(f"{BASE}/api/v1/health").mock(
+        return_value=httpx.Response(200, json={"status": "ok"})
+    )
+    authed.get(f"{BASE}/api/v1/auth/me").mock(
+        return_value=httpx.Response(401, json={"statusCode": 401, "message": "Unauthorized"})
+    )
+
+    async with Client(server.mcp) as c:
+        result = await c.call_tool("ping", {})
+
+    d = result.data
+    assert d["ok"] is True and d["authenticated"] is False
+    assert "API key was rejected" in d["error"]
+
+
+async def test_ping_reports_unreachable(authed):
+    authed.get(f"{BASE}/api/v1/health").mock(side_effect=httpx.ConnectError("refused"))
+
+    async with Client(server.mcp) as c:
+        result = await c.call_tool("ping", {})
+
+    assert result.data["ok"] is False and "refused" in result.data["error"]
 
 
 async def test_set_field_locks_builds_field_actions(authed):

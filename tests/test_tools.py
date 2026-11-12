@@ -14,22 +14,7 @@ from fastmcp import Client
 
 import server
 
-BASE = "http://booklore.test"
-
-
-@pytest.fixture
-def authed(respx_mock):
-    """Mock login and give each test a fresh client.
-
-    The server's lifespan closes the shared HTTP client when the in-memory
-    `Client(mcp)` context exits, so we reinstate a fresh, unauthenticated client
-    per test rather than reusing a closed one.
-    """
-    respx_mock.post(f"{BASE}/api/v1/auth/login").mock(
-        return_value=httpx.Response(200, json={"accessToken": "acc1", "refreshToken": "ref1"})
-    )
-    server.client = server.BookLoreClient(BASE, "tester", "secret")
-    return respx_mock
+BASE = "http://bookorbit.test"
 
 
 async def test_list_books_filters_and_limits(authed):
@@ -113,6 +98,31 @@ async def test_bulk_update_metadata_writes_arbitrary_fields(authed):
 
     body = json.loads(put.calls.last.request.content)
     assert body["metadata"] == {"isbn13": "999", "language": "en"}
+
+
+async def test_bulk_update_metadata_reports_partial_failure_in_order(authed):
+    for bid in (3, 4):
+        authed.get(f"{BASE}/api/v1/books/{bid}").mock(
+            return_value=httpx.Response(200, json={"id": bid, "metadata": {}})
+        )
+    authed.put(f"{BASE}/api/v1/books/3/metadata").mock(return_value=httpx.Response(200, json={}))
+    authed.put(f"{BASE}/api/v1/books/4/metadata").mock(return_value=httpx.Response(500))
+    patch = {"metadata": {"language": "en"}}
+    async with Client(server.mcp) as mcp_client:
+        result = await mcp_client.call_tool(
+            "bulk_update_metadata",
+            {
+                "items": [
+                    {"book_id": 3, "patch": patch},
+                    {"book_id": "x", "patch": patch},
+                    {"book_id": 4, "patch": patch},
+                ]
+            },
+        )
+
+    assert result.data["updated"] == [3]
+    assert [f["book_id"] for f in result.data["failed"]] == ["x", 4]
+    assert "integer 'book_id'" in result.data["failed"][0]["error"]
 
 
 async def test_delete_shelf_returns_confirmation(authed):

@@ -1,4 +1,4 @@
-"""Structured logging for the BookLore MCP server, built on structlog.
+"""Structured logging for the BookOrbit MCP server, built on structlog.
 
 Configurable via environment (or the `configure_logging` arguments, which win):
 
