@@ -44,15 +44,14 @@ BACKOFF = float(os.environ.get("BOOKORBIT_BACKOFF", "0.5"))
 log = get_logger("bookorbit")
 
 ReadStatus = Literal[
-    "UNREAD",
-    "READING",
-    "RE_READING",
-    "READ",
-    "PARTIALLY_READ",
-    "PAUSED",
-    "WONT_READ",
-    "ABANDONED",
-    "UNSET",
+    "unread",
+    "want_to_read",
+    "reading",
+    "on_hold",
+    "rereading",
+    "read",
+    "skimmed",
+    "abandoned",
 ]
 
 
@@ -519,6 +518,9 @@ class BookOrbitClient:
     async def put(self, path: str, **kw: Any) -> Any:
         return await self.request("PUT", path, **kw)
 
+    async def patch(self, path: str, **kw: Any) -> Any:
+        return await self.request("PATCH", path, **kw)
+
     async def delete(self, path: str, **kw: Any) -> Any:
         return await self.request("DELETE", path, **kw)
 
@@ -864,65 +866,6 @@ def _sort_spec(sort: str, order: str) -> list[dict[str, str]]:
     return [sort_by(sort, order)]  # type: ignore[arg-type]
 
 
-def _merge_list(current: list | None, add: list | None = None, remove: list | None = None) -> list:
-    """Case-insensitive add/remove on a string list, preserving order and casing."""
-    remove_lower = {str(r).lower() for r in (remove or [])}
-    result = [x for x in (current or []) if str(x).lower() not in remove_lower]
-    have = {str(x).lower() for x in result}
-    for a in add or []:
-        if str(a).lower() not in have:
-            result.append(a)
-            have.add(str(a).lower())
-    return result
-
-
-# Fields BookLore's clearFlags map accepts on PUT .../metadata. Setting a flag true nulls
-# that field regardless of replaceMode — the only way to clear ONE field without
-# REPLACE_ALL wiping the whole record. (From the backend's MetadataClearFlags class.)
-_CLEARABLE_FIELDS = {
-    "title",
-    "subtitle",
-    "publisher",
-    "publishedDate",
-    "description",
-    "seriesName",
-    "seriesNumber",
-    "seriesTotal",
-    "isbn13",
-    "isbn10",
-    "asin",
-    "goodreadsId",
-    "comicvineId",
-    "hardcoverId",
-    "hardcoverBookId",
-    "googleId",
-    "pageCount",
-    "language",
-    "amazonRating",
-    "amazonReviewCount",
-    "goodreadsRating",
-    "goodreadsReviewCount",
-    "hardcoverRating",
-    "hardcoverReviewCount",
-    "lubimyczytacId",
-    "lubimyczytacRating",
-    "ranobedbId",
-    "ranobedbRating",
-    "audibleId",
-    "audibleRating",
-    "audibleReviewCount",
-    "authors",
-    "categories",
-    "moods",
-    "tags",
-    "cover",
-    "reviews",
-    "narrator",
-    "abridged",
-    "ageRating",
-    "contentRating",
-}
-
 # Goodreads ids arrive both bare ("171712768") and slugged
 # ("23463279-designing-data-intensive-applications"); BookLore stores either verbatim.
 _GOODREADS_ID_RE = re.compile(r"^\s*(\d+)(?:-.*)?\s*$")
@@ -1019,40 +962,211 @@ async def _put_metadata(
     )
 
 
-def _validate_clear_fields(clear_fields: list[str] | None) -> None:
-    """Reject clearFlag names BookLore won't accept, with a helpful message."""
-    bad = sorted(set(clear_fields or []) - _CLEARABLE_FIELDS)
+# --- Metadata writes (BookOrbit v3.8.0 PATCH /books/:id/metadata) ------------
+#
+# PATCH semantics: a field you send is written, a field you omit is left alone, and
+# `null` clears a field. List fields (authors, genres, tags) are replaced whole.
+# Writing a field that is locked on the book is rejected by the server.
+
+# Fields UpdateBookMetadataDto accepts; anything else is a 400.
+METADATA_FIELDS = frozenset(
+    (
+        "title",
+        "subtitle",
+        "description",
+        "publisher",
+        "publishedDate",
+        "publishedYear",
+        "language",
+        "pageCount",
+        "seriesName",
+        "seriesIndex",
+        "seriesMemberships",
+        "isbn10",
+        "isbn13",
+        "rating",
+        "communityRatings",
+        "authors",
+        "genres",
+        "tags",
+        "googleBooksId",
+        "goodreadsId",
+        "amazonId",
+        "hardcoverId",
+        "hardcoverEditionId",
+        "openLibraryId",
+        "itunesId",
+        "audibleId",
+        "librofmId",
+        "koboId",
+        "comicvineId",
+        "ranobedbId",
+        "lubimyczytacId",
+        "aladinId",
+        "audioMetadata",
+        "comicMetadata",
+        "customMetadata",
+        "externalProviderIds",
+        "externalProviderLinks",
+    )
+)
+# List fields are cleared with [] rather than null.
+_LIST_METADATA_FIELDS = frozenset(("authors", "genres", "tags"))
+# Nested objects can't be cleared as a whole; edit their parts instead.
+_UNCLEARABLE_METADATA_FIELDS = frozenset(
+    (
+        "audioMetadata",
+        "comicMetadata",
+        "customMetadata",
+        "externalProviderIds",
+        "externalProviderLinks",
+    )
+)
+CLEARABLE_METADATA_FIELDS = METADATA_FIELDS - _UNCLEARABLE_METADATA_FIELDS
+# BookLore-era names and their BookOrbit replacements, for helpful errors.
+_RENAMED_FIELDS = {
+    "categories": "genres",
+    "seriesNumber": "seriesIndex",
+    "googleId": "googleBooksId",
+    "asin": "amazonId",
+    "personalRating": "rating (or set_personal_rating)",
+    "amazonRating": "communityRatings",
+    "goodreadsRating": "communityRatings",
+}
+
+# Fields that can be locked against metadata refreshes (BOOK_METADATA_LOCK_FIELDS).
+METADATA_LOCK_FIELDS = (
+    "title",
+    "subtitle",
+    "authors",
+    "description",
+    "publisher",
+    "publishedYear",
+    "language",
+    "pageCount",
+    "seriesName",
+    "seriesIndex",
+    "isbn13",
+    "isbn10",
+    "genres",
+    "tags",
+    "rating",
+    "communityRating",
+    "narrators",
+    "durationSeconds",
+    "abridged",
+    "chapters",
+    "googleBooksId",
+    "goodreadsId",
+    "amazonId",
+    "hardcoverId",
+    "hardcoverEditionId",
+    "openLibraryId",
+    "itunesId",
+    "audibleId",
+    "librofmId",
+    "koboId",
+    "comicvineId",
+    "ranobedbId",
+    "lubimyczytacId",
+    "aladinId",
+    "comicIssueNumber",
+    "comicVolumeName",
+    "comicStoryArcs",
+    "comicPencillers",
+    "comicInkers",
+    "comicColorists",
+    "comicLetterers",
+    "comicCoverArtists",
+    "comicCharacters",
+    "comicTeams",
+    "comicLocations",
+    "cover",
+    "audioCover",
+)
+
+_DATE_INPUT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$|^\d{4}-\d{2}-\d{2}T.+$")
+
+
+def _unknown_fields_error(kind: str, bad: list[str], valid: Any) -> BookOrbitError:
+    hints = [f"{b} -> {_RENAMED_FIELDS[b]}" for b in bad if b in _RENAMED_FIELDS]
+    hint = f" Renamed in BookOrbit: {'; '.join(hints)}." if hints else ""
+    return BookOrbitError(
+        f"Unknown {kind}: {', '.join(bad)}.{hint} Valid: {', '.join(sorted(valid))}."
+    )
+
+
+def _metadata_body(
+    metadata: dict[str, Any] | None, clear_fields: list[str] | None = None
+) -> dict[str, Any]:
+    """Build a PATCH /books/:id/metadata body: the given fields plus a clearing value
+    (null, or [] for lists) for each of `clear_fields`."""
+    metadata = dict(metadata or {})
+    bad = sorted(set(metadata) - METADATA_FIELDS)
     if bad:
-        raise BookOrbitError(
-            f"Cannot clear unknown field(s): {', '.join(bad)}. "
-            f"Clearable fields: {', '.join(sorted(_CLEARABLE_FIELDS))}."
-        )
+        raise _unknown_fields_error("metadata field(s)", bad, METADATA_FIELDS)
+    clear = list(clear_fields or [])
+    bad = sorted(set(clear) - CLEARABLE_METADATA_FIELDS)
+    if bad:
+        raise _unknown_fields_error("clearable field(s)", bad, CLEARABLE_METADATA_FIELDS)
+    both = sorted(set(clear) & set(metadata))
+    if both:
+        raise BookOrbitError(f"Field(s) both set and cleared: {', '.join(both)}.")
+    body = _normalize_metadata(metadata)
+    for field in clear:
+        body[field] = [] if field in _LIST_METADATA_FIELDS else None
+    return body
+
+
+async def _bulk_edit(
+    book_ids: list[int], field: Literal["tags", "genres"], mode: str, values: list[str]
+) -> dict[str, Any]:
+    """Add or remove tag/genre names on books with POST /books/bulk-edit-metadata,
+    which skips books where that field is locked. Returns
+    {book_ids, updated_books, skipped_locked}."""
+    if not book_ids:
+        raise BookOrbitError("Pass at least one book id.")
+    values = [v for v in values if isinstance(v, str) and v.strip()]
+    if not values:
+        raise BookOrbitError(f"Pass at least one {field[:-1]} name.")
+    result = await client.post(
+        "/api/v1/books/bulk-edit-metadata",
+        json={"bookIds": book_ids, "fields": {field: {"mode": mode, "values": values}}},
+    )
+    field_result = ((result or {}).get("fields") or {}).get(field) or {}
+    return {
+        "book_ids": book_ids,
+        "updated_books": (result or {}).get("updatedBooks", 0),
+        "skipped_locked": field_result.get("skippedLocked", 0),
+    }
+
+
+_PATCH_KEYS = ("tags", "genres", "metadata", "clear_fields")
 
 
 async def _apply_patch(book_id: int, patch: dict) -> dict:
     """Apply a per-book patch to one book; return its fresh record.
 
     `patch` keys:
-      - tags / categories: {"add": [...], "remove": [...]} — additive merges.
-      - metadata: {field: value, ...} — arbitrary BookMetadata fields written
-        with REPLACE_WHEN_PROVIDED (only the keys you pass; identifiers normalized).
-      - clear_fields: [field, ...] — fields to null out (see _put_metadata).
+      - tags / genres: {"add": [...], "remove": [...]} — merges; fails if the field
+        is locked on the book.
+      - metadata: {field: value, ...} — any update_book_metadata field.
+      - clear_fields: [field, ...] — fields to empty.
     """
-    clear_fields = patch.get("clear_fields") or []
-    _validate_clear_fields(clear_fields)
-    book = await client.get(f"/api/v1/books/{book_id}", params={"withDescription": "false"})
-    meta = book.get("metadata") or {}
-    meta_patch: dict[str, Any] = {}
-    for field in ("tags", "categories"):
-        if field in patch:
-            ops = patch[field] or {}
-            meta_patch[field] = _merge_list(meta.get(field), ops.get("add"), ops.get("remove"))
-    if extra := patch.get("metadata"):
-        meta_patch.update(_normalize_metadata(extra))
-    if not meta_patch and not clear_fields:
-        return book
-    await _put_metadata(book_id, meta_patch, clear_fields)
-    return await client.get(f"/api/v1/books/{book_id}", params={"withDescription": "false"})
+    bad = sorted(set(patch) - set(_PATCH_KEYS))
+    if bad:
+        raise _unknown_fields_error("patch key(s)", bad, _PATCH_KEYS)
+    body = _metadata_body(patch.get("metadata"), patch.get("clear_fields"))
+    for field in ("tags", "genres"):
+        ops = patch.get(field) or {}
+        for mode in ("add", "remove"):
+            if values := ops.get(mode):
+                result = await _bulk_edit([book_id], field, mode, list(values))  # type: ignore[arg-type]
+                if result["skipped_locked"]:
+                    raise BookOrbitError(f"'{field}' is locked on book {book_id}; unlock it first.")
+    if body:
+        return await client.patch(f"/api/v1/books/{book_id}/metadata", json=body)
+    return await client.get(f"/api/v1/books/{book_id}")
 
 
 # --- MCP server -------------------------------------------------------------
@@ -1196,123 +1310,216 @@ async def get_recommendations(
 async def update_book_metadata(
     book_id: int,
     metadata: dict | None = None,
-    replace_mode: Literal["REPLACE_WHEN_PROVIDED", "REPLACE_MISSING", "REPLACE_ALL"] = (
-        "REPLACE_WHEN_PROVIDED"
-    ),
-    merge_categories: bool = False,
     clear_fields: list[str] | None = None,
 ) -> dict:
-    """Update a book's metadata. `metadata` is a BookMetadata object (e.g.
-    {"title": ..., "authors": [...], "description": ..., "isbn13": ...}).
+    """Update a book's metadata. Only the fields you pass are written; every other
+    field is left as it is.
 
-    Replace modes (default REPLACE_WHEN_PROVIDED is the safe one):
-    - REPLACE_WHEN_PROVIDED — write only the fields you include; everything else
-      is left exactly as-is. Use this for fill-in/enrichment.
-    - REPLACE_MISSING — write a field only if it's currently empty (never
-      overwrites existing values; won't touch a non-empty author list).
-    - REPLACE_ALL — replace the WHOLE record with what you send: any field you
-      omit is wiped to null. Destructive — only use when you pass the full record.
+    `metadata` takes BookOrbit metadata fields, e.g. {"title": ..., "subtitle": ...,
+    "description": ..., "publisher": ..., "publishedDate": "YYYY-MM-DD",
+    "publishedYear": int, "language": ..., "pageCount": int, "seriesName": ...,
+    "seriesIndex": "1", "isbn10": ..., "isbn13": ..., "authors": [names],
+    "genres": [...], "tags": [...]}, and provider ids (googleBooksId, goodreadsId,
+    amazonId, hardcoverId, openLibraryId, ...). List fields (authors, genres, tags)
+    replace the whole list: use add_tags / add_genres to merge instead.
 
-    To CLEAR a field, list it in `clear_fields` (e.g. ["amazonRating"]). BookLore
-    nulls those fields regardless of replace_mode — under REPLACE_WHEN_PROVIDED a
-    `null` in `metadata` is ignored, so clear_fields is the way to empty one field
-    without REPLACE_ALL wiping the rest. `authors` is a list of name strings.
-    `goodreadsId` is normalized to its bare numeric id. Returns the updated record.
+    `clear_fields` empties fields, e.g. ["subtitle", "tags"]. A locked field can't be
+    written: unlock it with set_field_locks first. `goodreadsId` is reduced to its
+    bare numeric id. Returns the updated book.
     """
-    _validate_clear_fields(clear_fields)
-    metadata = _normalize_metadata(metadata or {})
-    # `clearFlags` must be present: the server's @Builder.Default isn't applied
-    # on JSON deserialization, so omitting it leaves it null and the API 500s.
-    clear_flags = {f: True for f in (clear_fields or [])}
-    return await client.put(
-        f"/api/v1/books/{book_id}/metadata",
-        params={"mergeCategories": str(merge_categories).lower(), "replaceMode": replace_mode},
-        json={"metadata": metadata, "clearFlags": clear_flags},
-    )
+    body = _metadata_body(metadata, clear_fields)
+    if not body:
+        raise BookOrbitError("Pass at least one field in `metadata` or `clear_fields`.")
+    return await client.patch(f"/api/v1/books/{book_id}/metadata", json=body)
 
 
 @mcp.tool(annotations={"idempotentHint": True, "title": "Set read status"})
-async def set_read_status(book_ids: list[int], status: ReadStatus) -> list[dict]:
-    """Set the reading status for one or more books (e.g. READING, READ, UNREAD).
-    Returns per-book update results."""
-    return await client.post("/api/v1/books/status", json={"bookIds": book_ids, "status": status})
+async def set_read_status(
+    book_ids: list[int],
+    status: ReadStatus,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+) -> dict:
+    """Set your reading status for one or more books: unread, want_to_read, reading,
+    on_hold, rereading, read, skimmed or abandoned. Optionally record when you
+    started or finished (YYYY-MM-DD or an ISO timestamp). Returns {book_ids, status}."""
+    if not book_ids:
+        raise BookOrbitError("Pass at least one book id.")
+    body: dict[str, Any] = {"bookIds": book_ids, "status": status}
+    for key, value in (("startedAt", started_at), ("finishedAt", finished_at)):
+        if value is not None:
+            if not _DATE_INPUT_RE.match(value):
+                raise BookOrbitError(f"{key} must be YYYY-MM-DD or an ISO timestamp.")
+            body[key] = value
+    await client.post("/api/v1/books/bulk-set-status", json=body)
+    return {"book_ids": book_ids, "status": status}
 
 
 @mcp.tool(annotations={"idempotentHint": True, "title": "Set personal rating"})
-async def set_personal_rating(book_ids: list[int], rating: int) -> list[dict]:
-    """Set your personal rating for one or more books. Rating uses BookLore's
-    configured scale (commonly 0-10 in half-star steps shown as 0-5 stars in the
-    UI). Returns per-book update results."""
-    return await client.put(
-        "/api/v1/books/personal-rating", json={"ids": book_ids, "rating": rating}
-    )
+async def set_personal_rating(book_ids: list[int], rating: int | None) -> dict:
+    """Set your personal rating (1-5 stars) for one or more books, or pass null to
+    clear it. Needs the library_edit_metadata permission. Returns {book_ids, rating}."""
+    if not book_ids:
+        raise BookOrbitError("Pass at least one book id.")
+    if rating is not None and not 1 <= rating <= 5:
+        raise BookOrbitError("rating must be 1 to 5, or null to clear it.")
+    await client.post("/api/v1/books/bulk-set-rating", json={"bookIds": book_ids, "rating": rating})
+    return {"book_ids": book_ids, "rating": rating}
 
 
-@mcp.tool(annotations={"idempotentHint": True, "title": "Assign / unassign shelves"})
-async def assign_shelves(
+@mcp.tool(annotations={"idempotentHint": True, "destructiveHint": False, "title": "Add tags"})
+async def add_tags(book_ids: list[int], tags: list[str]) -> dict:
+    """Add tags to books, keeping their existing tags (idempotent). Books whose tags
+    are locked are skipped and counted in `skipped_locked`. Returns {book_ids,
+    updated_books, skipped_locked}."""
+    return await _bulk_edit(book_ids, "tags", "add", tags)
+
+
+@mcp.tool(annotations={"idempotentHint": True, "title": "Remove tags"})
+async def remove_tags(book_ids: list[int], tags: list[str]) -> dict:
+    """Remove tags from books (idempotent; tags a book doesn't have are ignored).
+    Books whose tags are locked are skipped. Returns {book_ids, updated_books,
+    skipped_locked}."""
+    return await _bulk_edit(book_ids, "tags", "remove", tags)
+
+
+@mcp.tool(annotations={"idempotentHint": True, "destructiveHint": False, "title": "Add genres"})
+async def add_genres(book_ids: list[int], genres: list[str]) -> dict:
+    """Add genres to books, keeping their existing genres (idempotent). Books whose
+    genres are locked are skipped. Returns {book_ids, updated_books, skipped_locked}."""
+    return await _bulk_edit(book_ids, "genres", "add", genres)
+
+
+@mcp.tool(annotations={"idempotentHint": True, "title": "Remove genres"})
+async def remove_genres(book_ids: list[int], genres: list[str]) -> dict:
+    """Remove genres from books (idempotent). Books whose genres are locked are
+    skipped. Returns {book_ids, updated_books, skipped_locked}."""
+    return await _bulk_edit(book_ids, "genres", "remove", genres)
+
+
+@mcp.tool(annotations={"idempotentHint": True, "title": "Set metadata field locks"})
+async def set_field_locks(
     book_ids: list[int],
-    add_shelf_ids: list[int] | None = None,
-    remove_shelf_ids: list[int] | None = None,
+    lock: list[str] | None = None,
+    unlock: list[str] | None = None,
 ) -> list[dict]:
-    """Add and/or remove books from shelves in one call. Get shelf IDs from
-    list_shelves and book IDs from list_books. Returns the affected books."""
-    return await client.post(
-        "/api/v1/books/shelves",
-        json={
-            "bookIds": book_ids,
-            "shelvesToAssign": add_shelf_ids or [],
-            "shelvesToUnassign": remove_shelf_ids or [],
-        },
-    )
+    """Lock or unlock metadata fields so curated values survive metadata refreshes.
+
+    Field names: title, subtitle, authors, description, publisher, publishedYear,
+    language, pageCount, seriesName, seriesIndex, isbn13, isbn10, genres, tags,
+    rating, communityRating, cover, provider ids (goodreadsId, amazonId, ...),
+    audiobook and comic fields. Pass ["all"] as `lock` or `unlock` to lock or unlock
+    every field. Other locks on the book are kept. Returns [{book_id, locked_fields}].
+    """
+    lock, unlock = list(lock or []), list(unlock or [])
+    if not book_ids:
+        raise BookOrbitError("Pass at least one book id.")
+    if not lock and not unlock:
+        raise BookOrbitError("Provide at least one field in `lock` or `unlock`.")
+    if "all" in lock or "all" in unlock:
+        if lock and unlock or lock not in ([], ["all"]) or unlock not in ([], ["all"]):
+            raise BookOrbitError('"all" must be the only entry, in `lock` or in `unlock`.')
+        locked = bool(lock)
+        await client.post(
+            "/api/v1/books/bulk-set-metadata-lock", json={"bookIds": book_ids, "locked": locked}
+        )
+        fields = list(METADATA_LOCK_FIELDS) if locked else []
+        return [{"book_id": b, "locked_fields": fields} for b in book_ids]
+    bad = sorted(set(lock + unlock) - set(METADATA_LOCK_FIELDS))
+    if bad:
+        raise _unknown_fields_error("lock field(s)", bad, METADATA_LOCK_FIELDS)
+    both = sorted(set(lock) & set(unlock))
+    if both:
+        raise BookOrbitError(f"Field(s) both locked and unlocked: {', '.join(both)}.")
+
+    results = []
+    for book_id in book_ids:
+        book = await client.get(f"/api/v1/books/{book_id}")
+        wanted = (set(book.get("lockedFields") or []) | set(lock)) - set(unlock)
+        fields = [f for f in METADATA_LOCK_FIELDS if f in wanted]
+        await client.patch(f"/api/v1/books/{book_id}/metadata-locks", json={"lockedFields": fields})
+        results.append({"book_id": book_id, "locked_fields": fields})
+    return results
 
 
-@mcp.tool(annotations={"title": "Create shelf"})
-async def create_shelf(name: str, icon: str | None = None, public_shelf: bool = False) -> dict:
-    """Create a new shelf. Returns the created shelf including its new ID."""
-    body: dict[str, Any] = {"name": name, "publicShelf": public_shelf}
-    if icon:
-        body["icon"] = icon
-    return await client.post("/api/v1/shelves", json=body)
+@mcp.tool(annotations={"title": "Create collection"})
+async def create_collection(
+    name: str,
+    description: str | None = None,
+    icon: str = "Library",
+    is_public: bool = False,
+) -> dict:
+    """Create a collection. `icon` is a Lucide icon name (e.g. "Library",
+    "BookMarked", "Star"). A public collection is visible to other users. Returns the
+    created collection, including its id."""
+    body: dict[str, Any] = {"name": name, "icon": icon, "isPublic": is_public}
+    if description:
+        body["description"] = description
+    return await client.post("/api/v1/collections", json=body)
 
 
-@mcp.tool(annotations={"destructiveHint": True, "idempotentHint": True, "title": "Delete shelf"})
-async def delete_shelf(shelf_id: int) -> str:
-    """Delete a shelf by ID. Does NOT delete the books on it. This cannot be
-    undone — confirm the shelf ID with list_shelves first."""
-    await client.delete(f"/api/v1/shelves/{shelf_id}")
-    return f"Deleted shelf {shelf_id}."
+@mcp.tool(
+    annotations={"destructiveHint": True, "idempotentHint": True, "title": "Delete collection"}
+)
+async def delete_collection(collection_id: int) -> str:
+    """Delete a collection by id. The books in it are NOT deleted. This cannot be
+    undone: confirm the id with list_collections first."""
+    await client.delete(f"/api/v1/collections/{collection_id}")
+    return f"Deleted collection {collection_id}."
+
+
+@mcp.tool(
+    annotations={"idempotentHint": True, "destructiveHint": False, "title": "Add to collections"}
+)
+async def add_to_collections(book_ids: list[int], collection_ids: list[int]) -> dict:
+    """Add books to one or more collections, keeping their other collections
+    (idempotent). Returns {book_ids, collection_ids}."""
+    if not book_ids or not collection_ids:
+        raise BookOrbitError("Pass at least one book id and one collection id.")
+    for cid in collection_ids:
+        await client.post(f"/api/v1/collections/{cid}/books", json={"bookIds": book_ids})
+    return {"book_ids": book_ids, "collection_ids": collection_ids}
+
+
+@mcp.tool(annotations={"idempotentHint": True, "title": "Remove from collections"})
+async def remove_from_collections(book_ids: list[int], collection_ids: list[int]) -> dict:
+    """Remove books from one or more collections, keeping their other collections
+    (idempotent). The books themselves are not deleted. Returns {book_ids,
+    collection_ids}."""
+    if not book_ids or not collection_ids:
+        raise BookOrbitError("Pass at least one book id and one collection id.")
+    for cid in collection_ids:
+        await client.delete(f"/api/v1/collections/{cid}/books", json={"bookIds": book_ids})
+    return {"book_ids": book_ids, "collection_ids": collection_ids}
 
 
 @mcp.tool(annotations={"idempotentHint": True, "title": "Set reading progress"})
 async def set_reading_progress(
-    book_id: int,
     book_file_id: int,
-    progress_percent: float,
-    position_href: str | None = None,
-    position_data: str | None = None,
-    date_finished: str | None = None,
+    percentage: float,
+    cfi: str | None = None,
+    page_number: int | None = None,
+    position_seconds: float | None = None,
 ) -> str:
-    """Record reading progress for a book file.
+    """Record your reading position in one book file.
 
-    `book_file_id` is the file you're tracking — get it from get_book's
-    `primaryFile.id` (or `alternativeFormats`). `progress_percent` is 0-100.
-    `position_href` / `position_data` are optional format-specific resume
-    pointers (e.g. an EPUB CFI). Pass `date_finished` as an ISO-8601 timestamp
-    (e.g. "2026-06-09T12:00:00Z") to also mark the book finished.
+    `book_file_id` comes from get_book's `files` (use the file with role "primary"
+    unless you read another format). `percentage` is 0-100. Optionally pass a resume
+    point: an EPUB `cfi`, a `page_number` (PDF/comics), or `position_seconds`
+    (audiobooks). To mark a book finished, use set_read_status with "read".
     """
-    body: dict[str, Any] = {
-        "bookId": book_id,
-        "fileProgress": {
-            "bookFileId": book_file_id,
-            "progressPercent": progress_percent,
-            "positionHref": position_href,
-            "positionData": position_data,
-        },
-    }
-    if date_finished:
-        body["dateFinished"] = date_finished
-    await client.post("/api/v1/books/progress", json=body)
-    return f"Set reading progress for book {book_id} to {progress_percent}%."
+    if not 0 <= percentage <= 100:
+        raise BookOrbitError("percentage must be between 0 and 100.")
+    body: dict[str, Any] = {"percentage": percentage}
+    for key, value in (
+        ("cfi", cfi),
+        ("pageNumber", page_number),
+        ("positionSeconds", position_seconds),
+    ):
+        if value is not None:
+            body[key] = value
+    await client.post(f"/api/v1/books/files/{book_file_id}/progress", json=body)
+    return f"Set reading progress for file {book_file_id} to {percentage}%."
 
 
 @mcp.tool(
@@ -1320,12 +1527,30 @@ async def set_reading_progress(
 )
 async def reset_progress(
     book_ids: list[int],
-    source: Literal["BOOKLORE", "KOREADER", "KOBO"] = "BOOKLORE",
-) -> list[dict]:
-    """Clear reading progress for one or more books (max 500). `source` selects
-    which progress to wipe: BOOKLORE (the built-in reader), KOREADER, or KOBO.
-    This discards saved position — it cannot be undone."""
-    return await client.post("/api/v1/books/reset-progress", params={"type": source}, json=book_ids)
+    scope: Literal["progress", "everything"] = "progress",
+) -> dict:
+    """Clear your reading progress for one or more books. This cannot be undone.
+
+    `scope` "progress" clears the saved position in each of the book's files.
+    "everything" resets the book's whole reading state: positions (reader, audio,
+    KOReader), reading sessions and Kobo sync state. Neither changes the read status
+    (use set_read_status). Returns {scope, reset:[ids], failed:[{book_id, error}]}.
+    """
+    reset: list[int] = []
+    failed: list[dict] = []
+    for book_id in book_ids:
+        try:
+            if scope == "everything":
+                await client.post(f"/api/v1/books/{book_id}/reset-reading-state")
+            else:
+                entries = await client.get(f"/api/v1/books/{book_id}/progress") or []
+                for entry in entries:
+                    if isinstance(entry, dict) and entry.get("fileId") is not None:
+                        await client.delete(f"/api/v1/books/files/{entry['fileId']}/progress")
+            reset.append(book_id)
+        except BookOrbitError as exc:
+            failed.append({"book_id": book_id, "error": str(exc)})
+    return {"scope": scope, "reset": reset, "failed": failed}
 
 
 # ---- Search & discovery ----------------------------------------------------
@@ -1582,11 +1807,12 @@ async def bulk_update_metadata(
     Either pass `book_ids` + a single `patch` (applied to all), or `items`
     (`[{"book_id": int, "patch": {...}}]`) for per-book patches — not both.
     A `patch` may combine:
-      - "tags"/"categories": {"add": [...], "remove": [...]} — additive merges.
-      - "metadata": {field: value, ...} — arbitrary BookMetadata fields (isbn13,
-        language, publisher, seriesName, …) written with REPLACE_WHEN_PROVIDED.
-      - "clear_fields": [field, ...] — fields to null out.
-    This covers bulk fills beyond tags/categories (e.g. ISBNs). For read status use
+      - "tags"/"genres": {"add": [...], "remove": [...]} — merges; a book where the
+        field is locked fails.
+      - "metadata": {field: value, ...} — any update_book_metadata field (isbn13,
+        language, publisher, seriesName, ...); only those fields are written.
+      - "clear_fields": [field, ...] — fields to empty.
+    This covers bulk fills beyond tags/genres (e.g. ISBNs). For read status use
     bulk_set_read_status. Partial success is reported per book; one bad id never
     fails the batch. Returns {updated:[ids], failed:[{book_id,error}], books:[records]}.
     """
@@ -1613,57 +1839,6 @@ async def bulk_update_metadata(
         if ctx is not None:
             await ctx.report_progress(progress=done, total=total)
     return {"updated": updated, "failed": failed, "books": books}
-
-
-@mcp.tool(annotations={"idempotentHint": True, "title": "Add tags"})
-async def add_tags(book_id: int, tags: list[str]) -> dict:
-    """Add tags to a book (merge; idempotent; existing tags untouched). Returns the
-    post-write record. Safer than update_book_metadata for the common case."""
-    return await _apply_patch(book_id, {"tags": {"add": tags}})
-
-
-@mcp.tool(annotations={"idempotentHint": True, "title": "Remove tags"})
-async def remove_tags(book_id: int, tags: list[str]) -> dict:
-    """Remove tags from a book (idempotent; no error if a tag is absent). Returns the
-    post-write record."""
-    return await _apply_patch(book_id, {"tags": {"remove": tags}})
-
-
-@mcp.tool(annotations={"idempotentHint": True, "title": "Add categories"})
-async def add_categories(book_id: int, categories: list[str]) -> dict:
-    """Add categories to a book (merge; idempotent). Returns the post-write record."""
-    return await _apply_patch(book_id, {"categories": {"add": categories}})
-
-
-@mcp.tool(annotations={"idempotentHint": True, "title": "Remove categories"})
-async def remove_categories(book_id: int, categories: list[str]) -> dict:
-    """Remove categories from a book (idempotent). Returns the post-write record."""
-    return await _apply_patch(book_id, {"categories": {"remove": categories}})
-
-
-@mcp.tool(annotations={"idempotentHint": True, "title": "Set metadata field locks"})
-async def set_field_locks(
-    book_ids: list[int],
-    lock: list[str] | None = None,
-    unlock: list[str] | None = None,
-) -> list[dict]:
-    """Lock or unlock metadata fields so curated values survive a metadata refresh.
-
-    Field names are bare, e.g. "title", "authors", "tags", "categories",
-    "description", "cover", "seriesName". Pass them in `lock` and/or `unlock`
-    (a "Locked" suffix is added automatically). Returns updated metadata per book.
-    """
-    field_actions: dict[str, str] = {}
-    for field in lock or []:
-        field_actions[field if field.endswith("Locked") else f"{field}Locked"] = "LOCK"
-    for field in unlock or []:
-        field_actions[field if field.endswith("Locked") else f"{field}Locked"] = "UNLOCK"
-    if not field_actions:
-        raise BookOrbitError("Provide at least one field in `lock` or `unlock`.")
-    return await client.put(
-        "/api/v1/books/metadata/toggle-field-locks",
-        json={"bookIds": book_ids, "fieldActions": field_actions},
-    )
 
 
 # ---- Metadata lookups ------------------------------------------------------
@@ -1829,32 +2004,12 @@ async def fetch_metadata_candidates(
     return {"book_id": book_id, **await _search_metadata(params, providers)}
 
 
-@mcp.tool(annotations={"idempotentHint": True, "title": "Add books to shelves"})
-async def add_to_shelves(book_ids: list[int], shelf_ids: list[int]) -> list[dict]:
-    """Append books to shelves without disturbing their other shelves (idempotent).
-    The additive counterpart to assign_shelves. Returns the affected books."""
-    return await client.post(
-        "/api/v1/books/shelves",
-        json={"bookIds": book_ids, "shelvesToAssign": shelf_ids, "shelvesToUnassign": []},
-    )
-
-
-@mcp.tool(annotations={"idempotentHint": True, "title": "Remove books from shelves"})
-async def remove_from_shelves(book_ids: list[int], shelf_ids: list[int]) -> list[dict]:
-    """Remove books from shelves without disturbing their other shelves (idempotent).
-    Returns the affected books."""
-    return await client.post(
-        "/api/v1/books/shelves",
-        json={"bookIds": book_ids, "shelvesToAssign": [], "shelvesToUnassign": shelf_ids},
-    )
-
-
 @mcp.tool(annotations={"idempotentHint": True, "title": "Bulk set read status"})
 async def bulk_set_read_status(items: list[dict], ctx: Context | None = None) -> dict:
     """Set per-book reading status in bulk — e.g. importing a Goodreads CSV where each
-    book has its own status. `items` is [{"book_id": int, "status": ReadStatus}], with
-    status one of UNREAD/READING/RE_READING/READ/PARTIALLY_READ/PAUSED/WONT_READ/
-    ABANDONED/UNSET. Books are grouped by status and sent in ONE call per distinct
+    book has its own status. `items` is [{"book_id": int, "status": str}], with
+    status one of unread, want_to_read, reading, on_hold, rereading, read, skimmed,
+    abandoned. Books are grouped by status and sent in ONE call per distinct
     status (not one per book). Returns {updated, by_status:{status:count}, failed}.
     """
     valid = set(get_args(ReadStatus))
@@ -1873,7 +2028,7 @@ async def bulk_set_read_status(items: list[dict], ctx: Context | None = None) ->
     # One backend call per status group; report books processed as each lands.
     total = sum(len(ids) for ids in groups.values())
     for status, ids in groups.items():
-        await client.post("/api/v1/books/status", json={"bookIds": ids, "status": status})
+        await client.post("/api/v1/books/bulk-set-status", json={"bookIds": ids, "status": status})
         updated.extend(ids)
         by_status[status] = len(ids)
         if ctx is not None:

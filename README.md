@@ -29,32 +29,30 @@ a BookOrbit [API key](#configure-the-api-key).
 | `ping` | read | Liveness + API-key probe (down vs. key rejected), user, key permissions, server version, counts |
 | `isbn_lookup` | read | Look up an ISBN with the server's metadata providers; per-provider status |
 | `fetch_metadata_candidates` | read | Candidate metadata for a book from external providers (review, then apply); per-provider status |
-| `add_tags` / `remove_tags` | write | Add/remove tags on a book (merge, idempotent) |
-| `add_categories` / `remove_categories` | write | Add/remove categories (merge, idempotent) |
-| `bulk_update_metadata` | write | Apply per-book patches to many books — tags/categories, arbitrary fields, clears (partial-success) |
+| `add_tags` / `remove_tags` | write | Add/remove tags on books (merge, idempotent; skips books with tags locked) |
+| `add_genres` / `remove_genres` | write | Add/remove genres on books (merge, idempotent; skips books with genres locked) |
+| `bulk_update_metadata` | write | Apply per-book patches to many books — tags/genres, arbitrary fields, clears (partial-success) |
 | `bulk_set_read_status` | write | Set per-book reading status in bulk (e.g. a Goodreads import), grouped by status |
-| `set_field_locks` | write | Lock/unlock metadata fields so curated values survive a refresh |
-| `update_book_metadata` | write | Edit a book's metadata (field-merge by default; `clear_fields` to null a field; REPLACE_ALL to wipe omitted) |
-| `set_read_status` | write | Set reading status (READING/READ/…) |
-| `set_personal_rating` | write | Set your rating |
-| `assign_shelves` | write | Set books' shelves (add and/or remove) |
-| `add_to_shelves` / `remove_from_shelves` | write | Additive shelf membership (idempotent) |
-| `create_shelf` | write | Create a shelf |
-| `delete_shelf` | write | Delete a shelf (destructive) |
+| `set_field_locks` | write | Lock/unlock metadata fields (or `all`) so curated values survive a refresh |
+| `update_book_metadata` | write | Edit a book's metadata: only the fields you pass; `clear_fields` empties fields |
+| `set_read_status` | write | Set reading status (reading, read, abandoned, …) with optional start/finish dates |
+| `set_personal_rating` | write | Set or clear your 1-5 rating |
+| `add_to_collections` / `remove_from_collections` | write | Collection membership (idempotent; other collections untouched) |
+| `create_collection` | write | Create a collection |
+| `delete_collection` | write | Delete a collection, not its books (destructive) |
 | `set_reading_progress` | write | Record reading position / % for a book file |
-| `reset_progress` | write | Clear reading progress (destructive) |
+| `reset_progress` | write | Clear reading positions, or the whole reading state (destructive) |
 
 For bulk tagging/enrichment, prefer `search_books` (especially the `missing` filter,
 which runs on the server and covers fields like `isbn`, `description`, `genres` and
 per-provider community ratings such as `amazonRating`, with `missing_mode: any` for
 "lacking at least one") to find un-enriched books, plus the
-additive `add_tags`/`add_categories` and `bulk_update_metadata` — they merge by default
-and touch only the fields they manage. `update_book_metadata` defaults to
-`REPLACE_WHEN_PROVIDED` (writes only the fields you include, leaving the rest intact) —
-use that for fill-in enrichment; pass `clear_fields` to null a single field without
-touching the others. Its `REPLACE_ALL` mode replaces the **whole** record (any field you
-omit is wiped to null), so reserve it for deliberate full-record edits, and lock curated
-fields with `set_field_locks` first.
+additive `add_tags`/`add_genres` and `bulk_update_metadata` — they merge and touch only
+the fields they manage. `update_book_metadata` writes only the fields you include and
+leaves the rest intact; list fields (`authors`, `genres`, `tags`) you pass replace the
+whole list. Pass `clear_fields` to empty a field without touching the others. BookOrbit
+refuses to write a locked field, so lock curated fields with `set_field_locks` and unlock
+them before editing.
 
 `fetch_metadata_candidates` and `isbn_lookup` use the metadata providers enabled on
 your BookOrbit server (Google Books, Goodreads, Amazon, OpenLibrary, …). With only a

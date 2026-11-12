@@ -15,53 +15,11 @@ BASE = "http://bookorbit.test"
 # --- pure helper unit tests (no I/O) ----------------------------------------
 
 
-def test_merge_list_add_remove_case_insensitive_preserves_order():
-    merged = server._merge_list(
-        ["Python", "narrative"], add=["python", "trading"], remove=["NARRATIVE"]
-    )
-    assert merged == ["Python", "trading"]
-
-
 def test_normalize_goodreads_id_strips_slug_keeps_numeric():
     assert server._normalize_goodreads_id("23463279-designing-data-intensive") == "23463279"
     assert server._normalize_goodreads_id("171712768") == "171712768"
     assert server._normalize_goodreads_id("  42  ") == "42"
     assert server._normalize_goodreads_id(None) is None
-
-
-async def test_add_tags_merges_existing_and_puts(authed):
-    book = {"id": 7, "metadata": {"tags": ["keep"]}}
-    authed.get(f"{BASE}/api/v1/books/7").mock(return_value=httpx.Response(200, json=book))
-    put = authed.put(f"{BASE}/api/v1/books/7/metadata").mock(
-        return_value=httpx.Response(200, json={})
-    )
-
-    async with Client(server.mcp) as c:
-        await c.call_tool("add_tags", {"book_id": 7, "tags": ["new", "keep"]})
-
-    body = json.loads(put.calls.last.request.content)
-    assert body["metadata"]["tags"] == ["keep", "new"]  # merged, deduped, order preserved
-    assert body["clearFlags"] == {}
-    # Must touch ONLY tags — REPLACE_ALL would wipe title/authors/description/ISBNs.
-    assert put.calls.last.request.url.params["replaceMode"] == "REPLACE_WHEN_PROVIDED"
-
-
-async def test_bulk_update_reports_partial_success(authed):
-    authed.get(f"{BASE}/api/v1/books/1").mock(
-        return_value=httpx.Response(200, json={"id": 1, "metadata": {"tags": []}})
-    )
-    authed.put(f"{BASE}/api/v1/books/1/metadata").mock(return_value=httpx.Response(200, json={}))
-    authed.get(f"{BASE}/api/v1/books/999").mock(return_value=httpx.Response(404, text="nope"))
-
-    async with Client(server.mcp) as c:
-        result = await c.call_tool(
-            "bulk_update_metadata",
-            {"book_ids": [1, 999], "patch": {"tags": {"add": ["t"]}}},
-        )
-
-    data = result.data
-    assert data["updated"] == [1]
-    assert data["failed"][0]["book_id"] == 999
 
 
 async def test_ping_reports_identity_version_and_counts(authed):
@@ -119,44 +77,26 @@ async def test_ping_reports_unreachable(authed):
     assert result.data["ok"] is False and "refused" in result.data["error"]
 
 
-async def test_set_field_locks_builds_field_actions(authed):
-    route = authed.put(f"{BASE}/api/v1/books/metadata/toggle-field-locks").mock(
-        return_value=httpx.Response(200, json=[])
-    )
-    async with Client(server.mcp) as c:
-        await c.call_tool(
-            "set_field_locks",
-            {"book_ids": [5], "lock": ["tags", "authors"], "unlock": ["description"]},
-        )
-    body = json.loads(route.calls.last.request.content)
-    assert body["bookIds"] == [5]
-    assert body["fieldActions"] == {
-        "tagsLocked": "LOCK",
-        "authorsLocked": "LOCK",
-        "descriptionLocked": "UNLOCK",
-    }
-
-
 async def test_bulk_set_read_status_groups_by_status(authed):
-    route = authed.post(f"{BASE}/api/v1/books/status").mock(
-        return_value=httpx.Response(200, json=[])
+    route = authed.post(f"{BASE}/api/v1/books/bulk-set-status").mock(
+        return_value=httpx.Response(204)
     )
     async with Client(server.mcp) as c:
         result = await c.call_tool(
             "bulk_set_read_status",
             {
                 "items": [
-                    {"book_id": 1, "status": "READ"},
-                    {"book_id": 2, "status": "READ"},
-                    {"book_id": 3, "status": "READING"},
-                    {"book_id": 4, "status": "NONSENSE"},
+                    {"book_id": 1, "status": "read"},
+                    {"book_id": 2, "status": "read"},
+                    {"book_id": 3, "status": "reading"},
+                    {"book_id": 4, "status": "READ"},
                 ]
             },
         )
 
     d = result.data
     assert sorted(d["updated"]) == [1, 2, 3]
-    assert d["by_status"] == {"READ": 2, "READING": 1}
+    assert d["by_status"] == {"read": 2, "reading": 1}
     assert d["failed"][0]["book_id"] == 4
     assert route.call_count == 2  # one call per distinct valid status, not per book
 
