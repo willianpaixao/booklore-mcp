@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 import httpx
 from fastmcp import Client
 
@@ -99,30 +97,3 @@ async def test_bulk_set_read_status_groups_by_status(authed):
     assert d["by_status"] == {"read": 2, "reading": 1}
     assert d["failed"][0]["book_id"] == 4
     assert route.call_count == 2  # one call per distinct valid status, not per book
-
-
-async def test_normalize_goodreads_ids_dry_run_then_apply(authed):
-    books = [
-        {
-            "id": 21,
-            "title": "DDIA",
-            "metadata": {"goodreadsId": "23463279-designing-data-intensive"},
-        },
-        {"id": 22, "title": "Clean", "metadata": {"goodreadsId": "171712768"}},
-    ]
-    authed.get(f"{BASE}/api/v1/books").mock(return_value=httpx.Response(200, json=books))
-    put = authed.put(f"{BASE}/api/v1/books/21/metadata").mock(
-        return_value=httpx.Response(200, json={})
-    )
-    async with Client(server.mcp) as c:
-        dry = await c.call_tool("normalize_goodreads_ids", {})
-        # Only the slug record is flagged; the already-numeric one is left alone.
-        assert dry.data["dry_run"] is True
-        assert dry.data["to_change"] == [
-            {"book_id": 21, "from": "23463279-designing-data-intensive", "to": "23463279"}
-        ]
-        applied = await c.call_tool("normalize_goodreads_ids", {"dry_run": False})
-
-    assert applied.data["changed"][0]["book_id"] == 21
-    body = json.loads(put.calls.last.request.content)
-    assert body["metadata"] == {"goodreadsId": "23463279"}  # only the one field is touched

@@ -24,14 +24,14 @@ a BookOrbit [API key](#configure-the-api-key).
 | `export_library` | read | Export books (all, a collection, a library, or a search) as JSON or CSV; `fields` projection or `full=True` |
 | `find_duplicates` | scan | Run (or reuse) BookOrbit's duplicate scan and list duplicate / other-format groups; merges nothing |
 | `list_libraries` | read | Libraries with book counts, folders on the server and allowed formats |
-| `refresh_library` | write | Rescan a library's paths so BookLore ingests files added on disk |
-| `bookdrop_rescan` | write | Rescan BookLore's bookdrop folder for newly added files (staged for review) |
+| `refresh_library` | write | Scan a library's folders to import files added on disk; optionally wait and report added/updated/missing |
+| `book_dock_rescan` | write | Rescan the book dock (drop folder) for new files awaiting review |
 | `ping` | read | Liveness + API-key probe (down vs. key rejected), user, key permissions, server version, counts |
 | `isbn_lookup` | read | Look up an ISBN with the server's metadata providers; per-provider status |
 | `fetch_metadata_candidates` | read | Candidate metadata for a book from external providers (review, then apply); per-provider status |
 | `add_tags` / `remove_tags` | write | Add/remove tags on books (merge, idempotent; skips books with tags locked) |
 | `add_genres` / `remove_genres` | write | Add/remove genres on books (merge, idempotent; skips books with genres locked) |
-| `bulk_update_metadata` | write | Apply per-book patches to many books — tags/genres, arbitrary fields, clears (partial-success) |
+| `bulk_update_metadata` | write | Patch many books at once — tags/genres, any metadata field, clears; uses BookOrbit's bulk edit where it can (partial-success) |
 | `bulk_set_read_status` | write | Set per-book reading status in bulk (e.g. a Goodreads import), grouped by status |
 | `set_field_locks` | write | Lock/unlock metadata fields (or `all`) so curated values survive a refresh |
 | `update_book_metadata` | write | Edit a book's metadata: only the fields you pass; `clear_fields` empties fields |

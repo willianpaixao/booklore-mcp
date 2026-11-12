@@ -524,15 +524,6 @@ class BookOrbitClient:
     async def delete(self, path: str, **kw: Any) -> Any:
         return await self.request("DELETE", path, **kw)
 
-    async def get_books(self, with_description: bool = False) -> list[dict]:
-        """Fetch the full book list (`GET /books`)."""
-        return (
-            await self.get(
-                "/api/v1/books", params={"withDescription": str(with_description).lower()}
-            )
-            or []
-        )
-
     # -- book queries ----------------------------------------------------------
 
     async def query_books(
@@ -866,8 +857,9 @@ def _sort_spec(sort: str, order: str) -> list[dict[str, str]]:
     return [sort_by(sort, order)]  # type: ignore[arg-type]
 
 
-# Goodreads ids arrive both bare ("171712768") and slugged
-# ("23463279-designing-data-intensive-applications"); BookLore stores either verbatim.
+# Goodreads ids are pasted both bare ("171712768") and slugged, as in Goodreads URLs
+# ("23463279-designing-data-intensive-applications"). BookOrbit only strips whitespace
+# from provider ids, so writes reduce them to the bare id here.
 _GOODREADS_ID_RE = re.compile(r"^\s*(\d+)(?:-.*)?\s*$")
 
 
@@ -885,10 +877,6 @@ def _normalize_metadata(meta: dict) -> dict:
     if out.get("goodreadsId") is not None:
         out["goodreadsId"] = _normalize_goodreads_id(out["goodreadsId"])
     return out
-
-
-def _meta(book: dict) -> dict:
-    return book.get("metadata") or {}
 
 
 def _card_status(card: dict) -> str | None:
@@ -934,32 +922,6 @@ _EXPORT_DEFAULT_FIELDS = [
     "tags",
 ]
 EXPORT_LIMIT_MAX = 5000
-
-
-async def _all_books(with_description: bool = False) -> list[dict]:
-    return await client.get_books(with_description)
-
-
-async def _put_metadata(
-    book_id: int, meta_patch: dict, clear_fields: list[str] | None = None
-) -> Any:
-    """PUT a partial metadata object, touching ONLY the supplied fields.
-
-    Uses REPLACE_WHEN_PROVIDED: BookLore writes just the keys present in the
-    payload and leaves every other field untouched. (REPLACE_ALL would null out
-    every field we omit — title, authors, description, ISBNs — so it must never
-    be used with a partial patch.) `clearFlags` must be present or the API 500s.
-
-    `clear_fields` are field names to null out: BookLore honours a true clearFlag
-    regardless of replace mode, so it's the one way to clear a single field without
-    REPLACE_ALL wiping the rest.
-    """
-    clear_flags = {f: True for f in (clear_fields or [])}
-    return await client.put(
-        f"/api/v1/books/{book_id}/metadata",
-        params={"mergeCategories": "false", "replaceMode": "REPLACE_WHEN_PROVIDED"},
-        json={"metadata": meta_patch, "clearFlags": clear_flags},
-    )
 
 
 # --- Metadata writes (BookOrbit v3.8.0 PATCH /books/:id/metadata) ------------
@@ -1142,31 +1104,85 @@ async def _bulk_edit(
 
 
 _PATCH_KEYS = ("tags", "genres", "metadata", "clear_fields")
+# Fields POST /books/bulk-edit-metadata can set on many books in one call.
+_BULK_SCALAR_FIELDS = ("seriesName", "publisher", "language", "publishedYear")
+_BULK_LIST_FIELDS = ("authors", "genres", "tags")
+# Book ids per bulk-edit call.
+BULK_CHUNK_SIZE = 500
 
 
-async def _apply_patch(book_id: int, patch: dict) -> dict:
-    """Apply a per-book patch to one book; return its fresh record.
+def _bulk_edit_plan(patch: dict) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Split a bulk_update_metadata patch into bulk-edit `fields` payloads (each
+    applied to many books in one call) and the PATCH body for the remaining fields,
+    which BookOrbit can only write one book at a time.
 
-    `patch` keys:
-      - tags / genres: {"add": [...], "remove": [...]} — merges; fails if the field
-        is locked on the book.
+    A patch may hold:
+      - tags / genres: {"add": [...], "remove": [...]} — merges.
       - metadata: {field: value, ...} — any update_book_metadata field.
       - clear_fields: [field, ...] — fields to empty.
     """
+    if not isinstance(patch, dict) or not patch:
+        raise BookOrbitError("A patch needs at least one of: tags, genres, metadata, clear_fields.")
     bad = sorted(set(patch) - set(_PATCH_KEYS))
     if bad:
         raise _unknown_fields_error("patch key(s)", bad, _PATCH_KEYS)
     body = _metadata_body(patch.get("metadata"), patch.get("clear_fields"))
+
+    merge: dict[str, Any] = {}  # add + replace + scalar sets: one call
+    remove: dict[str, Any] = {}  # removals: a second call (one mode per field per call)
     for field in ("tags", "genres"):
-        ops = patch.get(field) or {}
-        for mode in ("add", "remove"):
-            if values := ops.get(mode):
-                result = await _bulk_edit([book_id], field, mode, list(values))  # type: ignore[arg-type]
-                if result["skipped_locked"]:
-                    raise BookOrbitError(f"'{field}' is locked on book {book_id}; unlock it first.")
-    if body:
-        return await client.patch(f"/api/v1/books/{book_id}/metadata", json=body)
-    return await client.get(f"/api/v1/books/{book_id}")
+        ops = patch.get(field)
+        if ops is None:
+            continue
+        if not isinstance(ops, dict) or set(ops) - {"add", "remove"}:
+            raise BookOrbitError(f'"{field}" takes {{"add": [...], "remove": [...]}}.')
+        for mode, target in (("add", merge), ("remove", remove)):
+            values = [v for v in ops.get(mode) or [] if isinstance(v, str) and v.strip()]
+            if values:
+                target[field] = {"mode": mode, "values": values}
+    for field in _BULK_LIST_FIELDS:
+        if field in body:
+            if field in merge or field in remove:
+                raise BookOrbitError(f"'{field}' is both replaced and merged in one patch.")
+            merge[field] = {"mode": "replace", "values": body.pop(field)}
+    for field in _BULK_SCALAR_FIELDS:
+        if field in body:
+            merge[field] = {"value": body.pop(field)}
+    payloads = [p for p in (merge, remove) if p]
+    if not payloads and not body:
+        raise BookOrbitError("The patch changes nothing.")
+    return payloads, body
+
+
+async def _apply_bulk_patch(
+    book_ids: list[int], patch: dict
+) -> tuple[list[int], list[dict], Counter[str]]:
+    """Apply one patch to many books. Returns (updated ids, failures, skipped-locked
+    counts per field). A failed bulk call fails every book in it."""
+    payloads, body = _bulk_edit_plan(patch)
+    skipped: Counter[str] = Counter()
+    try:
+        for fields in payloads:
+            for i in range(0, len(book_ids), BULK_CHUNK_SIZE):
+                result = await client.post(
+                    "/api/v1/books/bulk-edit-metadata",
+                    json={"bookIds": book_ids[i : i + BULK_CHUNK_SIZE], "fields": fields},
+                )
+                for field, r in ((result or {}).get("fields") or {}).items():
+                    skipped[field] += int((r or {}).get("skippedLocked") or 0)
+    except BookOrbitError as exc:
+        return [], [{"book_id": b, "error": str(exc)} for b in book_ids], skipped
+    if not body:
+        return list(book_ids), [], skipped
+    updated: list[int] = []
+    failed: list[dict] = []
+    for book_id in book_ids:
+        try:
+            await client.patch(f"/api/v1/books/{book_id}/metadata", json=body)
+            updated.append(book_id)
+        except BookOrbitError as exc:
+            failed.append({"book_id": book_id, "error": str(exc)})
+    return updated, failed, skipped
 
 
 # --- MCP server -------------------------------------------------------------
@@ -1802,43 +1818,65 @@ async def bulk_update_metadata(
     items: list[dict] | None = None,
     ctx: Context | None = None,
 ) -> dict:
-    """Apply per-book metadata patches to many books in one call.
+    """Apply metadata patches to many books in one call.
 
     Either pass `book_ids` + a single `patch` (applied to all), or `items`
     (`[{"book_id": int, "patch": {...}}]`) for per-book patches — not both.
     A `patch` may combine:
-      - "tags"/"genres": {"add": [...], "remove": [...]} — merges; a book where the
-        field is locked fails.
+      - "tags"/"genres": {"add": [...], "remove": [...]} — merges.
       - "metadata": {field: value, ...} — any update_book_metadata field (isbn13,
         language, publisher, seriesName, ...); only those fields are written.
       - "clear_fields": [field, ...] — fields to empty.
-    This covers bulk fills beyond tags/genres (e.g. ISBNs). For read status use
-    bulk_set_read_status. Partial success is reported per book; one bad id never
-    fails the batch. Returns {updated:[ids], failed:[{book_id,error}], books:[records]}.
+
+    Books that share a patch are written together: tags, genres, authors, series
+    name, publisher, language and published year go through BookOrbit's bulk edit
+    (a few calls however many books), other fields one book at a time. Bulk edit
+    skips books where a field is locked; `skipped_locked` counts those per field.
+    Partial success is reported per book; one bad id never fails the batch. For read
+    status use bulk_set_read_status. Returns {updated:[ids], failed:[{book_id,
+    error}], skipped_locked:{field: count}}.
     """
     if items and (book_ids or patch):
         raise BookOrbitError("Pass either book_ids+patch OR items, not both.")
     if not items and not (book_ids and patch):
         raise BookOrbitError("Provide book_ids+patch, or items.")
 
-    work = items if items else [{"book_id": bid, "patch": patch} for bid in (book_ids or [])]
-    total = len(work)
-
-    updated: list[int] = []
-    failed: list[dict] = []
-    books: list[dict] = []
-    for done, entry in enumerate(work, start=1):
-        bid = entry.get("book_id")
+    work: list[dict[str, Any]] = (
+        items if items else [{"book_id": bid, "patch": patch} for bid in (book_ids or [])]
+    )
+    order = {id(entry): i for i, entry in enumerate(work)}
+    failed: list[tuple[int, dict]] = []
+    groups: dict[str, tuple[dict, list[tuple[int, int]]]] = {}
+    for entry in work:
+        bid, entry_patch = entry.get("book_id"), entry.get("patch") or {}
         try:
-            if not isinstance(bid, int):
+            if not isinstance(bid, int) or isinstance(bid, bool):
                 raise BookOrbitError("each item needs an integer 'book_id'")
-            books.append(await _apply_patch(bid, entry.get("patch") or {}))
-            updated.append(bid)
-        except Exception as exc:
-            failed.append({"book_id": bid, "error": str(exc)})
+            _bulk_edit_plan(entry_patch)  # validate before anything is written
+        except BookOrbitError as exc:
+            failed.append((order[id(entry)], {"book_id": bid, "error": str(exc)}))
+            continue
+        key = json.dumps(entry_patch, sort_keys=True, default=str)
+        groups.setdefault(key, (entry_patch, []))[1].append((order[id(entry)], bid))
+
+    total = sum(len(members) for _, members in groups.values())
+    done = 0
+    updated: list[tuple[int, int]] = []
+    skipped: Counter[str] = Counter()
+    for group_patch, members in groups.values():
+        position = {bid: pos for pos, bid in members}
+        ok, bad, group_skipped = await _apply_bulk_patch([b for _, b in members], group_patch)
+        updated += [(position[b], b) for b in ok]
+        failed += [(position[f["book_id"]], f) for f in bad]
+        skipped.update(group_skipped)
+        done += len(members)
         if ctx is not None:
             await ctx.report_progress(progress=done, total=total)
-    return {"updated": updated, "failed": failed, "books": books}
+    return {
+        "updated": [b for _, b in sorted(updated)],
+        "failed": [f for _, f in sorted(failed, key=lambda x: x[0])],
+        "skipped_locked": dict(skipped),
+    }
 
 
 # ---- Metadata lookups ------------------------------------------------------
@@ -2209,66 +2247,69 @@ async def list_libraries() -> list[dict]:
     ]
 
 
-@mcp.tool(annotations={"idempotentHint": True, "openWorldHint": True, "title": "Refresh library"})
-async def refresh_library(library_id: int) -> dict:
-    """Trigger a rescan of a library's paths so BookLore ingests files added on disk.
+# Seconds between scan-history checks while waiting for a library scan.
+SCAN_POLL_INTERVAL = 2.0
 
-    Use after manually placing a book (e.g. a safaribooks EPUB) into one of the
-    library's paths — BookLore re-walks the paths, imports new files and reads their
-    embedded metadata. Scanning runs server-side and may take a moment to reflect in
-    the book list. Use `list_libraries` to find the id. Returns {library_id, status}.
+
+def _scan_job(job: dict) -> dict:
+    return {
+        "job_id": job.get("id"),
+        "status": job.get("status"),
+        "triggered_by": job.get("triggeredBy"),
+        "started_at": job.get("startedAt"),
+        "completed_at": job.get("completedAt"),
+        "added": job.get("addedCount"),
+        "updated": job.get("updatedCount"),
+        "missing": job.get("missingCount"),
+        "error": job.get("errorMessage"),
+    }
+
+
+@mcp.tool(annotations={"destructiveHint": False, "openWorldHint": True, "title": "Refresh library"})
+async def refresh_library(library_id: int, wait_seconds: float = 0) -> dict:
+    """Scan a library's folders so BookOrbit imports files added on disk and notices
+    removed ones. Use after placing a book in one of the library's folders (see
+    list_libraries for ids and folders).
+
+    The scan runs in the background. With `wait_seconds` > 0 this waits up to that
+    long for it to finish and reports how many books were added, updated or found
+    missing; otherwise it returns at once with status "running". BookOrbit refuses a
+    second scan while one is running. Needs the manage_libraries permission.
+    Returns {library_id, job_id, status, added, updated, missing, error}.
     """
-    await client.put(f"/api/v1/libraries/{library_id}/refresh")
-    return {"library_id": library_id, "status": "rescan triggered"}
+    started = await client.post(f"/api/v1/scanner/libraries/{library_id}/scan")
+    job_id = (started or {}).get("jobId")
+    result: dict[str, Any] = {"library_id": library_id, "job_id": job_id, "status": "running"}
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, wait_seconds)
+    while job_id is not None and loop.time() < deadline:
+        await asyncio.sleep(SCAN_POLL_INTERVAL)
+        history = await client.get(
+            f"/api/v1/scanner/libraries/{library_id}/scan-history", params={"limit": 5}
+        )
+        job = next((j for j in history or [] if j.get("id") == job_id), None)
+        if job is not None:
+            result = {"library_id": library_id, **_scan_job(job)}
+            if job.get("status") != "running":
+                break
+    return result
 
 
-@mcp.tool(annotations={"idempotentHint": True, "openWorldHint": True, "title": "Rescan bookdrop"})
-async def bookdrop_rescan() -> dict:
-    """Trigger a rescan of BookLore's bookdrop folder for files added on disk.
-
-    BookLore watches a dedicated "bookdrop" folder; files dropped there are staged for
-    review before import. Use this to pick up files added while the watcher was down or
-    that it missed. Staged files still need finalizing in the BookLore UI before they
-    enter a library. Returns {status}.
+@mcp.tool(
+    annotations={"destructiveHint": False, "openWorldHint": True, "title": "Rescan book dock"}
+)
+async def book_dock_rescan() -> dict:
+    """Rescan BookOrbit's book dock: the drop folder where new files wait for review
+    before they are imported into a library. Use it to pick up files the folder
+    watcher missed. Files found still need reviewing and finalizing in BookOrbit
+    before they enter a library. Needs the manage_book_dock permission. Returns
+    {status} and, when the key can read the book dock, its current `summary`.
     """
-    await client.post("/api/v1/bookdrop/rescan")
-    return {"status": "bookdrop rescan triggered"}
-
-
-@mcp.tool(annotations={"idempotentHint": True, "title": "Normalize Goodreads IDs"})
-async def normalize_goodreads_ids(dry_run: bool = True) -> dict:
-    """One-time cleanup: rewrite any stored goodreadsId held in slug form
-    ("23463279-designing-data-intensive-applications") to its bare numeric id
-    ("23463279"). BookLore persists both forms depending on the fetch path, and writes
-    through this MCP are normalized going forward — but pre-existing records aren't.
-
-    Scans the whole library. With dry_run=True (default) it only REPORTS what it would
-    change (review first); pass dry_run=False to apply. Each write touches only the
-    goodreadsId field (REPLACE_WHEN_PROVIDED, nothing else is altered).
-    Returns {scanned, dry_run, to_change|changed:[{book_id,from,to}], failed}.
-    """
-    books = await _all_books(with_description=True)
-    changes: list[dict] = []
-    for b in books:
-        gid = _meta(b).get("goodreadsId")
-        if not isinstance(gid, str) or not gid:
-            continue
-        norm = _normalize_goodreads_id(gid)
-        if norm != gid:
-            changes.append({"book_id": b.get("id"), "from": gid, "to": norm})
-
-    if dry_run:
-        return {"scanned": len(books), "dry_run": True, "to_change": changes, "failed": []}
-
-    changed: list[dict] = []
-    failed: list[dict] = []
-    for ch in changes:
-        try:
-            await _put_metadata(ch["book_id"], {"goodreadsId": ch["to"]})
-            changed.append(ch)
-        except Exception as exc:
-            failed.append({"book_id": ch["book_id"], "error": str(exc)})
-    return {"scanned": len(books), "dry_run": False, "changed": changed, "failed": failed}
+    await client.post("/api/v1/book-dock/rescan")
+    result: dict[str, Any] = {"status": "book dock rescan triggered"}
+    with suppress(BookOrbitError):
+        result["summary"] = await client.get("/api/v1/book-dock/summary")
+    return result
 
 
 def main() -> None:
