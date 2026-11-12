@@ -16,7 +16,8 @@ import os
 
 import pytest
 
-from server import BookOrbitClient
+import server
+from server import BookOrbitClient, all_of, any_of, build_book_query, rule, sort_by
 
 IT_URL = os.environ.get("BOOKORBIT_IT_URL", "").rstrip("/")
 IT_API_KEY = os.environ.get("BOOKORBIT_IT_API_KEY", "").strip()
@@ -47,3 +48,58 @@ async def test_api_key_authenticates():
     finally:
         await client.close()
     assert me["authenticationMethod"] == "api_key"
+
+
+# --- book queries (POST routes BookOrbit marks read-safe for API keys) ---------
+
+
+@pytest.fixture
+async def live():
+    client = BookOrbitClient(IT_URL, IT_API_KEY, timeout=60)
+    try:
+        yield client
+    finally:
+        await client.close()
+
+
+@needs_key
+async def test_unfiltered_query_total_matches_library_stats(live):
+    page = await live.query_books(build_book_query(size=1))
+    stats = await live.get("/api/v1/statistics/summary")
+    assert page["total"] == stats["totalBooks"]
+
+
+@needs_key
+async def test_paging_returns_distinct_books_up_to_the_bound(live):
+    ids = []
+    async for page in live.iter_book_pages(
+        max_books=7, page_size=3, sort=[sort_by("title"), sort_by("addedAt", "desc")]
+    ):
+        ids += [b["id"] for b in page["items"]]
+    expected = min(7, page["total"])
+    assert len(ids) == expected and len(set(ids)) == expected
+
+
+@needs_key
+async def test_server_accepts_client_validated_filters(live):
+    f = all_of(
+        any_of(rule("isbn", "isEmpty"), rule("genre", "isNotEmpty")),
+        rule("readStatus", "excludesAll", ["abandoned"]),
+        rule("addedAt", "before", "2999-01-01"),
+    )
+    page = await live.query_books(build_book_query(filter=f, size=2))
+    for card in page["items"]:
+        assert server._summarize_card(card).id == card["id"]
+
+
+@needs_key
+async def test_library_and_collection_scoped_queries(live):
+    libraries = await live.get("/api/v1/libraries")
+    if libraries:
+        page = await live.query_books(build_book_query(size=1), library_id=libraries[0]["id"])
+        assert "total" in page
+    collections = await live.get("/api/v1/collections")
+    if collections:
+        query = build_book_query(size=1, sort=[sort_by("collectionOrder")], collection_scoped=True)
+        page = await live.query_books(query, collection_id=collections[0]["id"])
+        assert page["total"] == collections[0]["bookCount"]

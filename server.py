@@ -15,6 +15,7 @@ import asyncio
 import csv
 import io
 import json
+import math
 import os
 import re
 from collections import Counter
@@ -100,6 +101,313 @@ def _api_error(method: str, path: str, resp: httpx.Response) -> BookOrbitError:
         parts.append(f"[{code}]")
     detail = f"{' '.join(parts)}: {message or resp.reason_phrase}"
     return BookOrbitError(f"{detail}. {hint}" if hint else detail)
+
+
+# --- Book query building and validation (BookOrbit v3.8.0) -------------------
+#
+# BookOrbit validates `POST /books/query` bodies server-side but answers a bad one
+# with a bare "Bad Request Exception", so queries are checked here first and fail
+# with a message that says what is wrong. The tables mirror v3.8.0's
+# packages/types/src/query.ts and server/src/modules/book/utils/group-rule.validator.ts.
+
+# Max books per page; page * size may not exceed QUERY_OFFSET_MAX.
+QUERY_PAGE_SIZE_MAX = 200
+QUERY_OFFSET_MAX = 1_000_000
+# Groups nest at most this deep, counting the top-level group.
+FILTER_MAX_DEPTH = 5
+SORT_SPECS_MAX = 5
+RULE_LIST_VALUES_MAX = 20
+
+_TEXT_OPS = ("contains", "notContains", "startsWith", "endsWith", "eq", "notEq")
+_PRESENCE_OPS = ("isEmpty", "isNotEmpty")
+_NUMERIC_OPS = ("eq", "notEq", "gt", "gte", "lt", "lte", "between")
+_DATE_OPS = ("before", "after", "between", "withinLast", "moreThanAgo")
+_SET_OPS = ("includesAny", "includesAll", "excludesAll")
+
+# Rule field -> the operators BookOrbit accepts for it. List values for author,
+# genre, tag, collection, library, format, readStatus and publisher/series/language
+# set rules are matched by NAME (e.g. a collection's name, not its id).
+FIELD_OPERATORS: dict[str, frozenset[str]] = {
+    "title": frozenset(_TEXT_OPS + _PRESENCE_OPS),
+    "publisher": frozenset(
+        ("contains", "notContains", "eq", "notEq", "includesAny", "excludesAll") + _PRESENCE_OPS
+    ),
+    "language": frozenset(("eq", "notEq", "includesAny", "excludesAll") + _PRESENCE_OPS),
+    "series": frozenset(
+        ("contains", "notContains", "eq", "notEq", "includesAny", "excludesAll") + _PRESENCE_OPS
+    ),
+    "author": frozenset(_SET_OPS + _PRESENCE_OPS),
+    "genre": frozenset(_SET_OPS + _PRESENCE_OPS),
+    "tag": frozenset(_SET_OPS + _PRESENCE_OPS),
+    "collection": frozenset(("includesAny", "excludesAll") + _PRESENCE_OPS),
+    "library": frozenset(("includesAny", "excludesAll")),
+    "format": frozenset(("includesAny", "excludesAll")),
+    "fileSize": frozenset(_NUMERIC_OPS + _PRESENCE_OPS),
+    "publishedDate": frozenset(_DATE_OPS + _PRESENCE_OPS),
+    "publishedYear": frozenset(_NUMERIC_OPS + _PRESENCE_OPS),
+    "seriesIndex": frozenset(_NUMERIC_OPS + _PRESENCE_OPS),
+    "pageCount": frozenset(("gt", "gte", "lt", "lte", "between") + _PRESENCE_OPS),
+    "addedAt": frozenset(_DATE_OPS),
+    "startedAt": frozenset(_DATE_OPS + _PRESENCE_OPS),
+    "finishedAt": frozenset(_DATE_OPS + _PRESENCE_OPS),
+    "fileAvailability": frozenset(("isMissing", "isPresent")),
+    "rating": frozenset(("eq", "gt", "gte", "lt", "lte") + _PRESENCE_OPS),
+    "communityRating": frozenset(_NUMERIC_OPS + _PRESENCE_OPS),
+    "communityRatingCount": frozenset(_NUMERIC_OPS + _PRESENCE_OPS),
+    "readProgress": frozenset(("isUnread", "isInProgress", "isFinished")),
+    "readStatus": frozenset(("includesAny", "excludesAll") + _PRESENCE_OPS),
+    "description": frozenset(_PRESENCE_OPS),
+    "isbn": frozenset(("eq",) + _PRESENCE_OPS),
+    "metadataScore": frozenset(("gt", "gte", "lt", "lte", "between") + _PRESENCE_OPS),
+    "cover": frozenset(("isMissing", "isPresent")),
+    "audioCover": frozenset(("isMissing", "isPresent")),
+    "lockStatus": frozenset(("isLocked", "isUnlocked")),
+    "seriesStatus": frozenset(("isUpNext",)),
+}
+# Operators a custom metadata field (`custom:<id>`) may use, across all field types.
+CUSTOM_FIELD_OPERATORS = frozenset(
+    _TEXT_OPS + _PRESENCE_OPS + _NUMERIC_OPS + _DATE_OPS + ("isTrue", "isFalse")
+)
+_CUSTOM_FIELD_RE = re.compile(r"^custom:[1-9]\d{0,8}$")
+_COMMUNITY_RATING_FIELDS = frozenset(("communityRating", "communityRatingCount"))
+# Static rule fields whose before/after/between values must be dates.
+_DATE_VALUE_FIELDS = frozenset(("addedAt", "startedAt", "finishedAt", "publishedDate"))
+_DATE_KEY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ISO_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+SORT_FIELDS = frozenset(
+    (
+        "relevance",
+        "author",
+        "title",
+        "series",
+        "seriesIndex",
+        "addedAt",
+        "updatedAt",
+        "publishedDate",
+        "publishedYear",
+        "pageCount",
+        "rating",
+        "publisher",
+        "fileSize",
+        "readProgress",
+        "readStatus",
+        "format",
+        "lastReadAt",
+        "startedAt",
+        "finishedAt",
+        "random",
+        "language",
+        "metadataScore",
+        "collectionOrder",
+    )
+)
+# Sort fields that only make sense inside one collection.
+COLLECTION_SORT_FIELDS = frozenset(("collectionOrder",))
+
+READ_STATUSES = (
+    "unread",
+    "want_to_read",
+    "reading",
+    "on_hold",
+    "rereading",
+    "read",
+    "skimmed",
+    "abandoned",
+)
+
+
+def rule(
+    field: str,
+    operator: str,
+    value: Any = None,
+    value_to: Any = None,
+    *,
+    provider: str | None = None,
+) -> dict[str, Any]:
+    """Build one filter rule, e.g. `rule("genre", "includesAny", ["Fantasy"])`."""
+    node: dict[str, Any] = {"type": "rule", "field": field, "operator": operator}
+    if value is not None:
+        node["value"] = value
+    if value_to is not None:
+        node["valueTo"] = value_to
+    if provider is not None:
+        node["provider"] = provider
+    return node
+
+
+def all_of(*rules: dict[str, Any]) -> dict[str, Any]:
+    """A group that matches books satisfying every rule (AND)."""
+    return {"type": "group", "join": "AND", "rules": list(rules)}
+
+
+def any_of(*rules: dict[str, Any]) -> dict[str, Any]:
+    """A group that matches books satisfying at least one rule (OR)."""
+    return {"type": "group", "join": "OR", "rules": list(rules)}
+
+
+def sort_by(field: str, direction: Literal["asc", "desc"] = "asc") -> dict[str, str]:
+    """One sort spec. BookOrbit's key is `dir`, not `direction`."""
+    return {"field": field, "dir": direction}
+
+
+def _is_rule_date(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return math.isfinite(value)
+    if not isinstance(value, str):
+        return False
+    v = value.strip()
+    return bool(_DATE_KEY_RE.match(v) or _ISO_DATETIME_RE.match(v))
+
+
+def _is_day_count(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, str) and value.strip():
+        try:
+            value = float(value)
+        except ValueError:
+            return False
+    return isinstance(value, (int, float)) and value >= 0
+
+
+def _validate_rule(node: dict[str, Any], where: str) -> None:
+    unknown = set(node) - {"type", "field", "operator", "value", "valueTo", "provider"}
+    if unknown:
+        raise BookOrbitError(f"{where}: unknown rule keys {sorted(unknown)}.")
+    field, op = node.get("field"), node.get("operator")
+    if not isinstance(field, str):
+        raise BookOrbitError(f"{where}: rule 'field' must be a string.")
+    custom = bool(_CUSTOM_FIELD_RE.match(field))
+    if not custom and field not in FIELD_OPERATORS:
+        raise BookOrbitError(
+            f"{where}: unknown filter field {field!r}. Valid fields: "
+            f"{', '.join(sorted(FIELD_OPERATORS))}, or custom:<id>."
+        )
+    allowed = CUSTOM_FIELD_OPERATORS if custom else FIELD_OPERATORS[field]
+    if op not in allowed:
+        raise BookOrbitError(
+            f"{where}: operator {op!r} is not valid for {field!r}. "
+            f"Valid operators: {', '.join(sorted(allowed))}."
+        )
+    if "provider" in node and field not in _COMMUNITY_RATING_FIELDS:
+        raise BookOrbitError(f"{where}: 'provider' only applies to community rating fields.")
+
+    value, value_to = node.get("value"), node.get("valueTo")
+    if isinstance(value, list):
+        if custom:
+            raise BookOrbitError(f"{where}: custom field rules do not accept list values.")
+        if not 1 <= len(value) <= RULE_LIST_VALUES_MAX:
+            raise BookOrbitError(
+                f"{where}: list values need 1 to {RULE_LIST_VALUES_MAX} items, got {len(value)}."
+            )
+        all_str = all(isinstance(v, str) and v for v in value)
+        all_num = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)
+        if not (all_str or all_num):
+            raise BookOrbitError(
+                f"{where}: list values must be all non-empty strings or all numbers."
+            )
+    elif value is not None and (
+        isinstance(value, bool) or not isinstance(value, (str, int, float))
+    ):
+        raise BookOrbitError(f"{where}: value must be a string, number, or list.")
+    if value_to is not None and (
+        isinstance(value_to, bool) or not isinstance(value_to, (str, int, float))
+    ):
+        raise BookOrbitError(f"{where}: valueTo must be a string or number.")
+    if op in _SET_OPS and not isinstance(value, list):
+        raise BookOrbitError(f"{where}: operator {op!r} needs a list value, e.g. ['Fantasy'].")
+
+    if field in _DATE_VALUE_FIELDS and op in ("before", "after", "between"):
+        if not _is_rule_date(value):
+            raise BookOrbitError(f"{where}: {op!r} needs a date value (YYYY-MM-DD).")
+        if op == "between" and not _is_rule_date(value_to):
+            raise BookOrbitError(f"{where}: 'between' needs a date valueTo (YYYY-MM-DD).")
+    if field in _DATE_VALUE_FIELDS and op == "moreThanAgo" and not _is_day_count(value):
+        raise BookOrbitError(f"{where}: 'moreThanAgo' needs a non-negative day count.")
+
+
+def validate_filter(node: dict[str, Any], *, _depth: int = 1, _where: str = "filter") -> None:
+    """Check a filter tree against BookOrbit's rules; raise BookOrbitError on the
+    first problem, naming where in the tree it is."""
+    if not isinstance(node, dict) or node.get("type") != "group":
+        raise BookOrbitError(f"{_where}: expected a group ({{'type': 'group', ...}}).")
+    if _depth > FILTER_MAX_DEPTH:
+        raise BookOrbitError(f"{_where}: groups nest at most {FILTER_MAX_DEPTH} deep.")
+    unknown = set(node) - {"type", "join", "rules"}
+    if unknown:
+        raise BookOrbitError(f"{_where}: unknown group keys {sorted(unknown)}.")
+    if node.get("join") not in ("AND", "OR"):
+        raise BookOrbitError(f"{_where}: join must be 'AND' or 'OR'.")
+    rules = node.get("rules")
+    if not isinstance(rules, list) or not rules:
+        raise BookOrbitError(f"{_where}: a group needs at least one rule.")
+    for i, child in enumerate(rules):
+        where = f"{_where}.rules[{i}]"
+        kind = child.get("type") if isinstance(child, dict) else None
+        if kind == "group":
+            validate_filter(child, _depth=_depth + 1, _where=where)
+        elif kind == "rule":
+            _validate_rule(child, where)
+        else:
+            raise BookOrbitError(f"{where}: expected a rule or a group (missing 'type').")
+
+
+def validate_sort(sort: list[dict[str, str]], *, collection_scoped: bool = False) -> None:
+    """Check sort specs against BookOrbit's sort fields."""
+    if len(sort) > SORT_SPECS_MAX:
+        raise BookOrbitError(f"At most {SORT_SPECS_MAX} sort specs are allowed.")
+    for i, spec in enumerate(sort):
+        if not isinstance(spec, dict) or set(spec) - {"field", "dir"}:
+            raise BookOrbitError(f"sort[{i}]: expected {{'field': ..., 'dir': 'asc'|'desc'}}.")
+        field = spec.get("field")
+        if not (field in SORT_FIELDS or (isinstance(field, str) and _CUSTOM_FIELD_RE.match(field))):
+            raise BookOrbitError(
+                f"sort[{i}]: unknown sort field {field!r}. Valid fields: "
+                f"{', '.join(sorted(SORT_FIELDS))}, or custom:<id>."
+            )
+        if field in COLLECTION_SORT_FIELDS and not collection_scoped:
+            raise BookOrbitError(f"sort[{i}]: {field!r} only works inside one collection.")
+        if spec.get("dir") not in ("asc", "desc"):
+            raise BookOrbitError(f"sort[{i}]: dir must be 'asc' or 'desc'.")
+
+
+def build_book_query(
+    *,
+    filter: dict[str, Any] | None = None,
+    sort: list[dict[str, str]] | None = None,
+    q: str | None = None,
+    page: int = 0,
+    size: int = 50,
+    collection_scoped: bool = False,
+) -> dict[str, Any]:
+    """Build and validate a BookOrbit `BookQuery` body.
+
+    Pages are 0-based, `size` is 1..200, and `page * size` may not exceed
+    1,000,000. `q` is BookOrbit's free-text search (max 200 characters).
+    """
+    if not 1 <= size <= QUERY_PAGE_SIZE_MAX:
+        raise BookOrbitError(f"Page size must be 1 to {QUERY_PAGE_SIZE_MAX}, got {size}.")
+    if page < 0:
+        raise BookOrbitError(f"Page must be 0 or more, got {page}.")
+    if page * size > QUERY_OFFSET_MAX:
+        raise BookOrbitError(f"Too deep: page * size must be at most {QUERY_OFFSET_MAX}.")
+    query: dict[str, Any] = {"pagination": {"page": page, "size": size}}
+    if filter is not None:
+        validate_filter(filter)
+        query["filter"] = filter
+    if sort:
+        validate_sort(sort, collection_scoped=collection_scoped)
+        query["sort"] = sort
+    if q:
+        if len(q) > 200:
+            raise BookOrbitError("Search text (q) may be at most 200 characters.")
+        query["q"] = q
+    return query
 
 
 class BookOrbitClient:
@@ -210,17 +518,83 @@ class BookOrbitClient:
         return await self.request("DELETE", path, **kw)
 
     async def get_books(self, with_description: bool = False) -> list[dict]:
-        """Fetch the full book list (BookLore's `GET /books`).
-
-        BookOrbit has no list-everything route; Phase 1 of ROADMAP.md replaces
-        this with paged `POST /books/query` calls.
-        """
+        """Fetch the full book list (`GET /books`)."""
         return (
             await self.get(
                 "/api/v1/books", params={"withDescription": str(with_description).lower()}
             )
             or []
         )
+
+    # -- book queries ----------------------------------------------------------
+
+    async def query_books(
+        self,
+        query: dict[str, Any],
+        *,
+        library_id: int | None = None,
+        collection_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Run one `BookQuery` and return the `BooksPage` (`items`, `total`, `page`,
+        `size`). Scope it to one library or one collection, or neither (all books
+        the key can see). Build `query` with `build_book_query`, which validates it:
+        the server answers a malformed query with a bare 400."""
+        if library_id is not None and collection_id is not None:
+            raise BookOrbitError("Scope a query to a library or a collection, not both.")
+        if library_id is not None:
+            path = f"/api/v1/libraries/{library_id}/books"
+        elif collection_id is not None:
+            path = f"/api/v1/collections/{collection_id}/books/query"
+        else:
+            path = "/api/v1/books/query"
+        return await self.post(path, json=query)
+
+    async def iter_book_pages(
+        self,
+        *,
+        max_books: int,
+        filter: dict[str, Any] | None = None,
+        sort: list[dict[str, str]] | None = None,
+        q: str | None = None,
+        library_id: int | None = None,
+        collection_id: int | None = None,
+        page_size: int = QUERY_PAGE_SIZE_MAX,
+        ctx: Context | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Page through a query, yielding each `BooksPage` in order.
+
+        Stops after `max_books` books (the last page is trimmed to fit) or when the
+        results run out, so a caller never pulls an unbounded library into memory.
+        A caller that needs to know whether it saw everything compares the books it
+        received with `total` on any page. Reports progress to `ctx` per page.
+        """
+        if max_books < 1:
+            raise BookOrbitError("max_books must be at least 1.")
+        size = min(page_size, max_books)
+        seen = 0
+        page = 0
+        while seen < max_books:
+            query = build_book_query(
+                filter=filter,
+                sort=sort,
+                q=q,
+                page=page,
+                size=size,
+                collection_scoped=collection_id is not None,
+            )
+            result = await self.query_books(
+                query, library_id=library_id, collection_id=collection_id
+            )
+            items = result.get("items") or []
+            total = int(result.get("total") or 0)
+            items = items[: max_books - seen]
+            seen += len(items)
+            if ctx is not None:
+                await ctx.report_progress(progress=seen, total=min(total, max_books))
+            yield {**result, "items": items}
+            if not items or seen >= total or (page + 1) * size > QUERY_OFFSET_MAX:
+                return
+            page += 1
 
     async def close(self) -> None:
         """Close the underlying HTTP connection pool."""
@@ -267,6 +641,56 @@ def _summarize_book(book: dict[str, Any]) -> BookSummary:
         readStatus=book.get("readStatus"),
         personalRating=book.get("personalRating"),
         shelves=shelves,
+    )
+
+
+class BookCardSummary(BaseModel):
+    """Trimmed view of a BookOrbit `BookCard` (one item of a `BooksPage`)."""
+
+    id: int
+    title: str | None = None
+    authors: list[str] = []
+    series: str | None = None
+    seriesIndex: str | None = None
+    readStatus: str | None = None
+    rating: float | None = None
+    readingProgress: float | None = None
+    genres: list[str] = []
+    tags: list[str] = []
+    formats: list[str] = []
+    publishedYear: int | None = None
+    libraryId: int | None = None
+
+
+def _summarize_card(card: dict[str, Any]) -> BookCardSummary:
+    """Trim a BookOrbit `BookCard` down to the fields most useful in a list view.
+
+    A card's `readStatus` is an object (`{status, source, startedAt, ...}`) or null;
+    the summary keeps just its `status`. `formats` lists each distinct file format,
+    primary file first.
+    """
+    status = card.get("readStatus")
+    formats: list[str] = []
+    files = [f for f in card.get("files") or [] if isinstance(f, dict)]
+    for f in sorted(files, key=lambda f: f.get("role") != "primary"):
+        fmt = f.get("format")
+        if fmt and fmt not in formats:
+            formats.append(fmt)
+    series_index = card.get("seriesIndex")
+    return BookCardSummary(
+        id=card["id"],
+        title=card.get("title"),
+        authors=[a for a in card.get("authors") or [] if isinstance(a, str)],
+        series=card.get("seriesName"),
+        seriesIndex=str(series_index) if series_index is not None else None,
+        readStatus=status.get("status") if isinstance(status, dict) else None,
+        rating=card.get("rating"),
+        readingProgress=card.get("readingProgress"),
+        genres=card.get("genres") or [],
+        tags=card.get("tags") or [],
+        formats=formats,
+        publishedYear=card.get("publishedYear"),
+        libraryId=card.get("libraryId"),
     )
 
 
@@ -1123,8 +1547,6 @@ async def bulk_update_metadata(
     updated: list[int] = []
     failed: list[dict] = []
     books: list[dict] = []
-    # Sequential on purpose: ROADMAP.md Phase 4 replaces this per-book loop with
-    # BookOrbit's native bulk endpoints.
     for done, entry in enumerate(work, start=1):
         bid = entry.get("book_id")
         try:
