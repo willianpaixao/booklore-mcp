@@ -103,3 +103,46 @@ async def test_library_and_collection_scoped_queries(live):
         query = build_book_query(size=1, sort=[sort_by("collectionOrder")], collection_scoped=True)
         page = await live.query_books(query, collection_id=collections[0]["id"])
         assert page["total"] == collections[0]["bookCount"]
+
+
+# --- read tools, through the MCP layer -----------------------------------------
+
+
+@pytest.fixture
+def live_tools(monkeypatch):
+    monkeypatch.setattr(server, "client", BookOrbitClient(IT_URL, IT_API_KEY, timeout=60))
+
+
+@needs_key
+async def test_reading_stats_statuses_add_up_to_total(live_tools):
+    from fastmcp import Client
+
+    async with Client(server.mcp) as c:
+        stats = (await c.call_tool("get_reading_stats", {})).data
+    assert sum(stats["by_status"].values()) == stats["total"]
+    assert stats["rated_count"] == sum(stats["ratings"].values())
+
+
+@needs_key
+async def test_search_missing_filter_matches_direct_query(live_tools):
+    from fastmcp import Client
+
+    async with Client(server.mcp) as c:
+        result = await c.call_tool(
+            "search_books",
+            {"filters": {"missing": ["isbn", "amazonRating"], "missing_mode": "any"}, "limit": 1},
+        )
+    direct_client = BookOrbitClient(IT_URL, IT_API_KEY)
+    direct = await direct_client.query_books(
+        build_book_query(
+            filter=all_of(
+                any_of(
+                    rule("isbn", "isEmpty"),
+                    rule("communityRating", "isEmpty", provider="amazon"),
+                )
+            ),
+            size=1,
+        )
+    )
+    await direct_client.close()
+    assert result.data.total == direct["total"]

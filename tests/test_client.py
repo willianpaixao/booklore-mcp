@@ -125,3 +125,19 @@ async def test_retries_transient_5xx_then_succeeds(respx_mock):
     client = BookOrbitClient(BASE, KEY, retries=2, backoff=0)
     assert await client.get("/api/v1/libraries") == [{"id": 1}]
     assert route.call_count == 2  # one retry after the 503
+
+
+async def test_hint_does_not_repeat_server_message(respx_mock):
+    respx_mock.post(f"{BASE}/api/v1/collections").mock(
+        return_value=httpx.Response(
+            403, json={"message": "This API key is read-only", "errorCode": "API_KEY_READ_ONLY"}
+        )
+    )
+
+    client = BookOrbitClient(BASE, KEY)
+    with pytest.raises(BookOrbitError) as excinfo:
+        await client.post("/api/v1/collections", json={"name": "x"})
+    assert str(excinfo.value) == (
+        "POST /api/v1/collections -> 403 [API_KEY_READ_ONLY]: This API key is read-only; "
+        "use a 'Read and write' key for write tools."
+    )

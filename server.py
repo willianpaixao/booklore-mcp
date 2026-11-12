@@ -19,7 +19,7 @@ import math
 import os
 import re
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal, get_args
 
@@ -99,8 +99,13 @@ def _api_error(method: str, path: str, resp: httpx.Response) -> BookOrbitError:
     parts = [f"{method} {path} -> {resp.status_code}"]
     if code:
         parts.append(f"[{code}]")
-    detail = f"{' '.join(parts)}: {message or resp.reason_phrase}"
-    return BookOrbitError(f"{detail}. {hint}" if hint else detail)
+    message = str(message or resp.reason_phrase).rstrip(".")
+    if hint and message.lower() in hint.lower():
+        message = ""  # the hint already says it
+    detail = f"{' '.join(parts)}: {message}" if message else " ".join(parts)
+    if not hint:
+        return BookOrbitError(detail)
+    return BookOrbitError(f"{detail}. {hint}" if message else f"{detail}: {hint}")
 
 
 # --- Book query building and validation (BookOrbit v3.8.0) -------------------
@@ -613,37 +618,6 @@ client = BookOrbitClient(
 # --- Helpers ----------------------------------------------------------------
 
 
-class BookSummary(BaseModel):
-    """Trimmed view of a Book, returned by the list-style read tools."""
-
-    id: int | None = None
-    title: str | None = None
-    authors: list[str] | None = None
-    series: str | None = None
-    readStatus: str | None = None
-    personalRating: float | None = None
-    shelves: list[str] = []
-
-
-def _summarize_book(book: dict[str, Any]) -> BookSummary:
-    """Trim a full Book record down to the fields most useful in a list view."""
-    meta = book.get("metadata") or {}
-    raw_authors = meta.get("authors")
-    authors: list[str] | None = _author_names(meta) if isinstance(raw_authors, list) else None
-    shelves = [
-        s["name"] for s in (book.get("shelves") or []) if isinstance(s, dict) and s.get("name")
-    ]
-    return BookSummary(
-        id=book.get("id"),
-        title=book.get("title") or meta.get("title"),
-        authors=authors,
-        series=meta.get("seriesName"),
-        readStatus=book.get("readStatus"),
-        personalRating=book.get("personalRating"),
-        shelves=shelves,
-    )
-
-
 class BookCardSummary(BaseModel):
     """Trimmed view of a BookOrbit `BookCard` (one item of a `BooksPage`)."""
 
@@ -695,117 +669,199 @@ def _summarize_card(card: dict[str, Any]) -> BookCardSummary:
 
 
 class SearchResult(BaseModel):
-    """Paginated result envelope for search_books / books_by_author."""
+    """Paginated result envelope for the book-listing tools."""
 
     total: int
     limit: int
     offset: int
-    books: list[BookSummary]
+    books: list[BookCardSummary]
 
 
-def _author_names(meta: dict) -> list[str]:
-    """Author display names from a metadata object (authors may be dicts or strings)."""
-    names = []
-    for a in meta.get("authors") or []:
-        name = a.get("name") if isinstance(a, dict) else a
-        if name:
-            names.append(str(name))
-    return names
+async def _fetch_window(
+    fetch: Callable[[int, int], Awaitable[dict[str, Any]]],
+    *,
+    offset: int,
+    limit: int,
+    max_page_size: int,
+    items_key: str = "items",
+    ctx: Context | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Fetch items [offset, offset + limit) from a 0-based paged endpoint.
+
+    `fetch(page, size)` returns one page carrying `items_key` and `total`. Uses the
+    fewest pages that cover the window (an offset that is not a multiple of the page
+    size costs one extra page). Returns (items, total).
+    """
+    if limit < 1:
+        raise BookOrbitError("limit must be at least 1.")
+    if offset < 0:
+        raise BookOrbitError("offset must be 0 or more.")
+    size = min(max_page_size, limit)
+    first, last = offset // size, (offset + limit - 1) // size
+    items: list[dict[str, Any]] = []
+    total = 0
+    for page in range(first, last + 1):
+        result = await fetch(page, size)
+        batch = result.get(items_key) or []
+        total = int(result.get("total") or 0)
+        items.extend(batch)
+        if ctx is not None:
+            await ctx.report_progress(progress=page - first + 1, total=last - first + 1)
+        if len(batch) < size:
+            break
+    start = offset - first * size
+    return items[start : start + limit], total
 
 
-# Predicates for `missing` filtering — True means the field is empty/absent. `isbn`
-# and `description` are sparsely populated upstream; `cover` uses coverUpdatedOn as a
-# presence proxy (BookLore doesn't expose a cover URL on the book record).
-_MISSING_CHECKS = {
-    "tags": lambda m: not m.get("tags"),
-    "categories": lambda m: not m.get("categories"),
-    "authors": lambda m: not _author_names(m),
-    "description": lambda m: not m.get("description"),
-    "isbn": lambda m: not (m.get("isbn10") or m.get("isbn13")),
-    "isbn10": lambda m: not m.get("isbn10"),
-    "isbn13": lambda m: not m.get("isbn13"),
-    "series": lambda m: not m.get("seriesName"),
-    "cover": lambda m: not m.get("coverUpdatedOn"),
-    "asin": lambda m: not m.get("asin"),
-    "goodreadsId": lambda m: not m.get("goodreadsId"),
-    "googleId": lambda m: not m.get("googleId"),
-    "hardcoverId": lambda m: not m.get("hardcoverId"),
-    "amazonRating": lambda m: not m.get("amazonRating"),
-    "goodreadsRating": lambda m: not m.get("goodreadsRating"),
-    "publisher": lambda m: not m.get("publisher"),
-    "language": lambda m: not m.get("language"),
-    "pageCount": lambda m: not m.get("pageCount"),
+async def _books_window(
+    *,
+    offset: int,
+    limit: int,
+    filter: dict[str, Any] | None = None,
+    sort: list[dict[str, str]] | None = None,
+    q: str | None = None,
+    library_id: int | None = None,
+    collection_id: int | None = None,
+    ctx: Context | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """A window of BookCards from a (validated) book query; returns (cards, total)."""
+
+    async def fetch(page: int, size: int) -> dict[str, Any]:
+        query = build_book_query(
+            filter=filter,
+            sort=sort,
+            q=q,
+            page=page,
+            size=size,
+            collection_scoped=collection_id is not None,
+        )
+        return await client.query_books(query, library_id=library_id, collection_id=collection_id)
+
+    return await _fetch_window(
+        fetch, offset=offset, limit=limit, max_page_size=QUERY_PAGE_SIZE_MAX, ctx=ctx
+    )
+
+
+async def _names_by_id(path: str, ids: list[int], what: str, lister: str) -> list[str]:
+    """Map library or collection ids to names. BookOrbit's `library` and `collection`
+    filter rules match by name, and an id silently matches nothing."""
+    rows = await client.get(path) or []
+    names: dict[int, str] = {
+        r["id"]: str(r["name"]) for r in rows if isinstance(r, dict) and r.get("name")
+    }
+    unknown = [i for i in ids if i not in names]
+    if unknown:
+        raise BookOrbitError(f"Unknown {what} id(s): {unknown}. Use {lister} to find ids.")
+    return [names[i] for i in ids]
+
+
+# search_books `missing` field -> the BookOrbit rule that is true when it is empty.
+_MISSING_RULES: dict[str, dict[str, Any]] = {
+    "tags": rule("tag", "isEmpty"),
+    "genres": rule("genre", "isEmpty"),
+    "authors": rule("author", "isEmpty"),
+    "collections": rule("collection", "isEmpty"),
+    "series": rule("series", "isEmpty"),
+    "description": rule("description", "isEmpty"),
+    "isbn": rule("isbn", "isEmpty"),
+    "publisher": rule("publisher", "isEmpty"),
+    "language": rule("language", "isEmpty"),
+    "pageCount": rule("pageCount", "isEmpty"),
+    "publishedDate": rule("publishedDate", "isEmpty"),
+    "cover": rule("cover", "isMissing"),
+    "rating": rule("rating", "isEmpty"),
+    "communityRating": rule("communityRating", "isEmpty", provider="any"),
+    "amazonRating": rule("communityRating", "isEmpty", provider="amazon"),
+    "goodreadsRating": rule("communityRating", "isEmpty", provider="goodreads"),
+    "googleRating": rule("communityRating", "isEmpty", provider="google"),
+    "hardcoverRating": rule("communityRating", "isEmpty", provider="hardcover"),
 }
-# Of the missing-checks, those whose field BookLore strips from the plain list response.
-_MISSING_FULL_ONLY = {"asin", "goodreadsId", "googleId", "hardcoverId", "description"}
 
-_SORT_KEYS = {
-    "title": lambda b: (b.get("title") or (b.get("metadata") or {}).get("title") or "").lower(),
-    "addedOn": lambda b: b.get("addedOn") or "",
-    "rating": lambda b: b["personalRating"] if b.get("personalRating") is not None else -1,
-    "readStatus": lambda b: b.get("readStatus") or "",
-}
-
-
-def _matches_query(book: dict, q: str) -> bool:
-    """Case-insensitive substring match over title/subtitle/isbn/author names."""
-    meta = book.get("metadata") or {}
-    parts = [
-        book.get("title") or meta.get("title"),
-        meta.get("subtitle"),
-        meta.get("isbn10"),
-        meta.get("isbn13"),
-        *_author_names(meta),
-    ]
-    return q in " ".join(str(x) for x in parts if x).lower()
+_SEARCH_FILTER_KEYS = (
+    "tags",
+    "tags_mode",
+    "genres",
+    "genres_mode",
+    "authors",
+    "collection_ids",
+    "library_ids",
+    "read_status",
+    "missing",
+    "missing_mode",
+    "rules",
+)
 
 
-def _matches_filters(book: dict, filters: dict) -> bool:
-    """Apply a search_books `filters` object to a raw book record."""
-    meta = book.get("metadata") or {}
+def _mode(filters: dict[str, Any], key: str) -> str:
+    mode = filters.get(key, "any")
+    if mode not in ("any", "all"):
+        raise BookOrbitError(f"{key} must be 'any' or 'all', got {mode!r}.")
+    return str(mode)
 
+
+async def _search_filter(filters: dict[str, Any]) -> dict[str, Any] | None:
+    """Translate search_books `filters` into one BookOrbit filter group (or None)."""
+    unknown = sorted(set(filters) - set(_SEARCH_FILTER_KEYS))
+    if unknown:
+        raise BookOrbitError(
+            f"Unknown filter key(s): {', '.join(unknown)}. Valid: {', '.join(_SEARCH_FILTER_KEYS)}."
+        )
+    rules: list[dict[str, Any]] = []
     if tags := filters.get("tags"):
-        have = {t.lower() for t in (meta.get("tags") or [])}
-        want = {t.lower() for t in tags}
-        if filters.get("tags_mode") == "all":
-            if not want.issubset(have):
-                return False
-        elif not (want & have):
-            return False
-
-    if cats := filters.get("categories"):
-        have = {c.lower() for c in (meta.get("categories") or [])}
-        if not ({c.lower() for c in cats} & have):
-            return False
-
+        op = "includesAll" if _mode(filters, "tags_mode") == "all" else "includesAny"
+        rules.append(rule("tag", op, list(tags)))
+    if genres := filters.get("genres"):
+        op = "includesAll" if _mode(filters, "genres_mode") == "all" else "includesAny"
+        rules.append(rule("genre", op, list(genres)))
     if authors := filters.get("authors"):
-        names = [n.lower() for n in _author_names(meta)]
-        if not any(q.lower() in n for q in authors for n in names):
-            return False
-
-    if shelf_ids := filters.get("shelf_ids"):
-        have_ids = {s.get("id") for s in (book.get("shelves") or []) if isinstance(s, dict)}
-        if not (set(shelf_ids) & have_ids):
-            return False
-
-    if (rs := filters.get("read_status")) and (book.get("readStatus") or "UNSET") != rs:
-        return False
-
-    if (libs := filters.get("library_ids")) and book.get("libraryId") not in set(libs):
-        return False
-
-    # `missing`: filter on empty fields. mode "all" (default) keeps a book only when every
-    # listed field is empty; mode "any" keeps it when at least one listed field is empty.
+        rules.append(rule("author", "includesAny", list(authors)))
+    if collection_ids := filters.get("collection_ids"):
+        names = await _names_by_id(
+            "/api/v1/collections", list(collection_ids), "collection", "list_collections"
+        )
+        rules.append(rule("collection", "includesAny", names))
+    if library_ids := filters.get("library_ids"):
+        names = await _names_by_id(
+            "/api/v1/libraries", list(library_ids), "library", "list_libraries"
+        )
+        rules.append(rule("library", "includesAny", names))
+    if status := filters.get("read_status"):
+        statuses = [status] if isinstance(status, str) else list(status)
+        bad = [s for s in statuses if s not in READ_STATUSES]
+        if bad:
+            raise BookOrbitError(
+                f"Unknown read_status {bad}. Valid: {', '.join(READ_STATUSES)} "
+                f"('unread' also matches books with no status)."
+            )
+        rules.append(rule("readStatus", "includesAny", statuses))
     if missing := filters.get("missing"):
-        flags = [_MISSING_CHECKS[f](meta) for f in missing if f in _MISSING_CHECKS]
-        if flags:
-            if filters.get("missing_mode") == "any":
-                if not any(flags):
-                    return False
-            elif not all(flags):
-                return False
+        bad = sorted(set(missing) - set(_MISSING_RULES))
+        if bad:
+            raise BookOrbitError(
+                f"Unknown missing field(s): {', '.join(bad)}. Valid: {', '.join(_MISSING_RULES)}."
+            )
+        empties = [dict(_MISSING_RULES[f]) for f in missing]
+        if filters.get("missing_mode", "all") not in ("any", "all"):
+            raise BookOrbitError("missing_mode must be 'any' or 'all'.")
+        if len(empties) == 1:
+            rules.extend(empties)
+        else:
+            rules.append(
+                any_of(*empties) if filters.get("missing_mode") == "any" else all_of(*empties)
+            )
+    if raw := filters.get("rules"):
+        rules.append(raw)
+    if not rules:
+        return None
+    combined = all_of(*rules)
+    validate_filter(combined)
+    return combined
 
-    return True
+
+def _sort_spec(sort: str, order: str) -> list[dict[str, str]]:
+    if order not in ("asc", "desc"):
+        raise BookOrbitError("order must be 'asc' or 'desc'.")
+    return [sort_by(sort, order)]  # type: ignore[arg-type]
 
 
 def _merge_list(current: list | None, add: list | None = None, remove: list | None = None) -> list:
@@ -819,20 +875,6 @@ def _merge_list(current: list | None, add: list | None = None, remove: list | No
             have.add(str(a).lower())
     return result
 
-
-# MetadataProvider enum name -> key under settings.metadataProviderSettings. Mostly a
-# lowercased first letter, but GoodReads/Lubimyczytac don't follow that, so map explicitly.
-_PROVIDER_SETTINGS_KEY = {
-    "Amazon": "amazon",
-    "Google": "google",
-    "GoodReads": "goodReads",
-    "Hardcover": "hardcover",
-    "Comicvine": "comicvine",
-    "Douban": "douban",
-    "Lubimyczytac": "lubimyczytac",
-    "Ranobedb": "ranobedb",
-    "Audible": "audible",
-}
 
 # Fields BookLore's clearFlags map accepts on PUT .../metadata. Setting a flag true nulls
 # that field regardless of replaceMode — the only way to clear ONE field without
@@ -902,74 +944,53 @@ def _normalize_metadata(meta: dict) -> dict:
     return out
 
 
-# Provider enum name -> its provider-specific field toggles under
-# settings.metadataProviderSpecificFields. These gate whether a field is *persisted* on
-# auto-fetch/refresh; a disabled toggle leaves that field empty library-wide even when the
-# provider runs (e.g. goodreadsRating off => no book ever gets a Goodreads rating).
-_PROVIDER_SPECIFIC_FIELDS = {
-    "Amazon": ["asin", "amazonRating", "amazonReviewCount"],
-    "Google": ["googleId"],
-    "GoodReads": ["goodreadsId", "goodreadsRating", "goodreadsReviewCount"],
-    "Hardcover": ["hardcoverId", "hardcoverBookId", "hardcoverRating", "hardcoverReviewCount"],
-    "Comicvine": ["comicvineId"],
-    "Lubimyczytac": ["lubimyczytacId", "lubimyczytacRating"],
-    "Ranobedb": ["ranobedbId", "ranobedbRating"],
-    "Audible": ["audibleId", "audibleRating", "audibleReviewCount"],
-    "Douban": [],
-}
-
-
-async def _app_settings() -> dict | None:
-    """Best-effort read of the full app settings (provider enablement, Amazon cookie,
-    provider-specific field toggles). Returns None when the endpoint is unavailable
-    (e.g. permission denied), so callers degrade to result-only status rather than fail."""
-    with suppress(BookOrbitError):
-        settings = await client.get("/api/v1/settings")
-        if isinstance(settings, dict):
-            return settings
-    return None
-
-
 def _meta(book: dict) -> dict:
     return book.get("metadata") or {}
 
 
-def _shelf_names(book: dict) -> list[str]:
-    return [s["name"] for s in (book.get("shelves") or []) if isinstance(s, dict) and s.get("name")]
+def _card_status(card: dict) -> str | None:
+    status = card.get("readStatus")
+    return status.get("status") if isinstance(status, dict) else None
 
 
-# Flat field extractors for export_library's `fields` projection. Fields beyond the plain
-# list view (asin, goodreadsId, googleId, hardcoverId, subtitle, description) are stripped
-# by BookLore's list endpoint, so selecting them forces a withDescription fetch.
+# export_library columns, read from a BookOrbit `BookCard`.
 _EXPORT_FIELDS: dict[str, Any] = {
-    "id": lambda b: b.get("id"),
-    "title": lambda b: b.get("title") or _meta(b).get("title"),
-    "subtitle": lambda b: _meta(b).get("subtitle"),
-    "authors": lambda b: _author_names(_meta(b)),
-    "series": lambda b: _meta(b).get("seriesName"),
-    "seriesNumber": lambda b: _meta(b).get("seriesNumber"),
-    "publisher": lambda b: _meta(b).get("publisher"),
-    "publishedDate": lambda b: _meta(b).get("publishedDate"),
-    "language": lambda b: _meta(b).get("language"),
-    "pageCount": lambda b: _meta(b).get("pageCount"),
-    "isbn10": lambda b: _meta(b).get("isbn10"),
-    "isbn13": lambda b: _meta(b).get("isbn13"),
-    "asin": lambda b: _meta(b).get("asin"),
-    "goodreadsId": lambda b: _meta(b).get("goodreadsId"),
-    "googleId": lambda b: _meta(b).get("googleId"),
-    "hardcoverId": lambda b: _meta(b).get("hardcoverId"),
-    "amazonRating": lambda b: _meta(b).get("amazonRating"),
-    "goodreadsRating": lambda b: _meta(b).get("goodreadsRating"),
-    "personalRating": lambda b: b.get("personalRating"),
-    "readStatus": lambda b: b.get("readStatus"),
-    "tags": lambda b: list(_meta(b).get("tags") or []),
-    "categories": lambda b: list(_meta(b).get("categories") or []),
-    "description": lambda b: _meta(b).get("description"),
-    "shelves": _shelf_names,
+    "id": lambda c: c.get("id"),
+    "title": lambda c: c.get("title"),
+    "subtitle": lambda c: c.get("subtitle"),
+    "authors": lambda c: list(c.get("authors") or []),
+    "series": lambda c: c.get("seriesName"),
+    "seriesIndex": lambda c: c.get("seriesIndex"),
+    "publisher": lambda c: c.get("publisher"),
+    "publishedDate": lambda c: c.get("publishedDate"),
+    "publishedYear": lambda c: c.get("publishedYear"),
+    "language": lambda c: c.get("language"),
+    "pageCount": lambda c: c.get("pageCount"),
+    "isbn13": lambda c: c.get("isbn13"),
+    "hardcoverId": lambda c: c.get("hardcoverId"),
+    "genres": lambda c: list(c.get("genres") or []),
+    "tags": lambda c: list(c.get("tags") or []),
+    "narrators": lambda c: list(c.get("narrators") or []),
+    "rating": lambda c: c.get("rating"),
+    "readStatus": _card_status,
+    "readingProgress": lambda c: c.get("readingProgress"),
+    "formats": lambda c: _summarize_card(c).formats,
+    "addedAt": lambda c: c.get("addedAt"),
+    "metadataScore": lambda c: c.get("metadataScore"),
+    "lockedFields": lambda c: list(c.get("lockedFields") or []),
+    "libraryId": lambda c: c.get("libraryId"),
 }
-
-# Export/missing fields BookLore omits from the plain list response (need withDescription).
-_FULL_ONLY_FIELDS = {"asin", "goodreadsId", "googleId", "hardcoverId", "subtitle", "description"}
+_EXPORT_DEFAULT_FIELDS = [
+    "id",
+    "title",
+    "authors",
+    "series",
+    "readStatus",
+    "rating",
+    "genres",
+    "tags",
+]
+EXPORT_LIMIT_MAX = 5000
 
 
 async def _all_books(with_description: bool = False) -> list[dict]:
@@ -1050,11 +1071,11 @@ mcp = FastMCP(
     name="bookorbit",
     lifespan=lifespan,
     instructions=(
-        "Tools for a self-hosted BookOrbit library. Book and shelf IDs are not "
-        "guessable — use list_books / list_shelves to discover them before "
-        "calling tools that take an ID. list_books returns trimmed summaries; "
-        "call get_book for the full record including metadata. To set reading "
-        "progress you need a book_file_id — read it from get_book's primaryFile."
+        "Tools for a self-hosted BookOrbit library. Book, collection and library IDs "
+        "are not guessable: use list_books / search_books, list_collections and "
+        "list_libraries to discover them before calling tools that take an ID. The "
+        "listing tools return trimmed summaries; call get_book for the full record, "
+        "including the file ids that reading-progress tools need."
     ),
 )
 
@@ -1065,84 +1086,107 @@ mcp = FastMCP(
 @mcp.tool(
     annotations={"readOnlyHint": True, "idempotentHint": True, "title": "List / search books"}
 )
-async def list_books(query: str = "", limit: int = 25) -> list[BookSummary]:
-    """List books in the library, optionally filtered by a keyword.
-
-    `query` is matched (case-insensitive substring) against title and author
-    names client-side; leave empty to list everything. Returns trimmed summaries
-    (id, title, authors, series, readStatus, personalRating, shelves) capped at
-    `limit`. Call get_book for full details on one book.
-    """
-    books = await client.get("/api/v1/books", params={"withDescription": "false"}) or []
-    summaries = [_summarize_book(b) for b in books]
-    if query:
-        q = query.lower()
-
-        def matches(s: BookSummary) -> bool:
-            hay = " ".join(str(x) for x in [s.title, *(s.authors or [])] if x).lower()
-            return q in hay
-
-        summaries = [s for s in summaries if matches(s)]
-    return summaries[:limit]
+async def list_books(query: str = "", limit: int = 25) -> list[BookCardSummary]:
+    """List books, optionally matching a free-text `query` (BookOrbit's own search over
+    title, authors, series, ISBN and more). Returns up to `limit` (max 200) trimmed
+    summaries sorted by title. For filters, sorting or paging use search_books; for
+    one book's full record use get_book."""
+    cards, _ = await _books_window(
+        offset=0,
+        limit=max(1, min(limit, QUERY_PAGE_SIZE_MAX)),
+        q=query or None,
+        sort=[sort_by("relevance", "desc")] if query else [sort_by("title")],
+    )
+    return [_summarize_card(c) for c in cards]
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Get book details"})
 async def get_book(book_id: int, with_description: bool = True) -> dict:
-    """Fetch a single book's full record by ID, including its metadata.
+    """Fetch one book's full record by ID: metadata, authors, genres, tags, series,
+    files (with file ids), collections, provider ids/links, community ratings, locked
+    fields, your read status, rating and note. Set with_description=False to drop the
+    (often long) description. Find ids with list_books / search_books."""
+    book = await client.get(f"/api/v1/books/{book_id}")
+    if not with_description and isinstance(book, dict):
+        book.pop("description", None)
+    return book
 
-    Use list_books first if you don't know the ID. Set with_description=False to
-    omit the (potentially long) description field.
-    """
-    return await client.get(
-        f"/api/v1/books/{book_id}",
-        params={"withDescription": str(with_description).lower()},
+
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "List collections"})
+async def list_collections() -> list[dict]:
+    """List the collections you can see (yours and public ones): id, name,
+    description, book count, and whether it's public or yours. Use
+    get_collection_books to see the books in one."""
+    rows = await client.get("/api/v1/collections") or []
+    return [
+        {
+            "id": c.get("id"),
+            "name": c.get("name"),
+            "description": c.get("description"),
+            "book_count": c.get("bookCount"),
+            "is_public": c.get("isPublic"),
+            "is_owner": c.get("isOwner"),
+        }
+        for c in rows
+        if isinstance(c, dict)
+    ]
+
+
+@mcp.tool(
+    annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Get books in a collection"}
+)
+async def get_collection_books(
+    collection_id: int,
+    sort: str = "collectionOrder",
+    order: Literal["asc", "desc"] = "asc",
+    limit: int = 50,
+    offset: int = 0,
+) -> SearchResult:
+    """List the books in a collection as trimmed summaries, paginated. Sorted by the
+    collection's own order by default; any search_books sort field also works. Get
+    collection ids from list_collections."""
+    cards, total = await _books_window(
+        offset=offset,
+        limit=max(1, min(limit, QUERY_PAGE_SIZE_MAX)),
+        sort=_sort_spec(sort, order),
+        collection_id=collection_id,
+    )
+    return SearchResult(
+        total=total, limit=limit, offset=offset, books=[_summarize_card(c) for c in cards]
     )
 
 
-@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "List shelves"})
-async def list_shelves() -> list[dict]:
-    """List all shelves (id, name, icon, public flag). Use get_shelf_books to see
-    the books on a given shelf."""
-    return await client.get("/api/v1/shelves") or []
+_RELATED_PATHS = {
+    "similar": "recommendations",
+    "series": "series-books",
+    "author": "author-books",
+}
 
 
-@mcp.tool(
-    annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Get books on a shelf"}
-)
-async def get_shelf_books(shelf_id: int) -> list[BookSummary]:
-    """List the books on a shelf, as trimmed summaries. Get shelf IDs from
-    list_shelves."""
-    books = await client.get(f"/api/v1/shelves/{shelf_id}/books") or []
-    return [_summarize_book(b) for b in books]
-
-
-@mcp.tool(
-    annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Get recommendations"}
-)
-async def get_recommendations(book_id: int, limit: int = 10) -> list[dict]:
-    """Get books recommended as similar to the given book (max 25)."""
-    return (
-        await client.get(
-            f"/api/v1/books/{book_id}/recommendations",
-            params={"limit": max(1, min(limit, 25))},
-        )
-        or []
-    )
-
-
-@mcp.tool(
-    annotations={
-        "readOnlyHint": True,
-        "idempotentHint": True,
-        "openWorldHint": True,
-        "title": "Look up metadata by ISBN",
-    }
-)
-async def isbn_lookup(isbn: str) -> dict:
-    """Fetch book metadata for an ISBN from BookLore's external providers
-    (Google Books, OpenLibrary, etc.). Read-only lookup — does not modify any
-    book. Use update_book_metadata to apply the result to a book."""
-    return await client.post("/api/v1/metadata/isbn-lookup", json={"isbn": isbn})
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Get related books"})
+async def get_recommendations(
+    book_id: int,
+    kind: Literal["similar", "series", "author"] = "similar",
+    limit: int = 10,
+) -> list[dict]:
+    """Books related to the given one: `similar` (BookOrbit's recommendations, up to
+    25), other books in the same `series`, or more by the same `author`. Returns
+    trimmed entries (id, title, authors, read status)."""
+    rows = await client.get(f"/api/v1/books/{book_id}/{_RELATED_PATHS[kind]}") or []
+    out = []
+    for b in rows[: max(1, limit)]:
+        if not isinstance(b, dict):
+            continue
+        entry = {
+            "id": b.get("id"),
+            "title": b.get("title"),
+            "authors": b.get("authors") or [],
+            "readStatus": _card_status(b),
+        }
+        if b.get("seriesIndex") is not None:
+            entry["seriesIndex"] = b.get("seriesIndex")
+        out.append(entry)
+    return out
 
 
 # ---- Write tools -----------------------------------------------------------
@@ -1291,132 +1335,143 @@ async def reset_progress(
 async def search_books(
     query: str = "",
     filters: dict | None = None,
-    sort: Literal["title", "addedOn", "rating", "readStatus"] = "title",
+    sort: str = "title",
     order: Literal["asc", "desc"] = "asc",
     limit: int = 50,
     offset: int = 0,
 ) -> SearchResult:
-    """Search and filter the library server-side-style, returning a paginated page.
+    """Search and filter the library on the server, returning one page of summaries.
 
-    `query` is a case-insensitive substring over title/subtitle/isbn/author names.
-    `filters` is an optional object:
-      - tags: [str], tags_mode: "any"|"all" (default "any")
-      - categories: [str] (any), authors: [str] (any, substring)
-      - shelf_ids: [int], library_ids: [int]
-      - read_status: "UNSET"|"READING"|"READ"|"UNREAD"|… (sparse upstream)
-      - missing: subset of ["tags","categories","authors","description","isbn",
-        "isbn10","isbn13","series","cover","asin","goodreadsId","googleId",
-        "hardcoverId","amazonRating","goodreadsRating","publisher","language",
-        "pageCount"] — fields to treat as empty.
-      - missing_mode: "all" (default) keeps books where ALL listed fields are
-        empty; "any" keeps books missing AT LEAST ONE — better for enrichment
-        sweeps ("anything still lacking an id/rating").
-    Returns {total, limit, offset, books:[summaries]}. `limit` is capped at 200.
+    `query` is BookOrbit's free-text search (title, authors, series, ISBN, ...).
+    `filters` is an optional object; every key narrows the result (AND):
+      - tags: [str], tags_mode: "any" (default) | "all" — exact tag names
+      - genres: [str], genres_mode: "any" | "all" — exact genre names
+      - authors: [str] — any author whose name contains one of these
+      - collection_ids: [int], library_ids: [int] — from list_collections /
+        list_libraries
+      - read_status: str or [str] — unread, want_to_read, reading, on_hold, rereading,
+        read, skimmed, abandoned ("unread" also matches books never marked)
+      - missing: fields that must be empty — tags, genres, authors, collections,
+        series, description, isbn, publisher, language, pageCount, publishedDate,
+        cover, rating (yours), communityRating (from any provider), amazonRating,
+        goodreadsRating, googleRating, hardcoverRating
+      - missing_mode: "all" (default) keeps books where every listed field is empty;
+        "any" keeps books missing at least one (good for enrichment sweeps)
+      - rules: a raw BookOrbit filter group, for anything the keys above don't cover
+    Lists take at most 20 values. `sort` is one of: title, author, series, seriesIndex,
+    addedAt, updatedAt, publishedDate, publishedYear, pageCount, rating, publisher,
+    fileSize, readProgress, readStatus, format, lastReadAt, startedAt, finishedAt,
+    language, metadataScore, relevance (with `query`), random. `limit` is capped at 200.
+    Returns {total, limit, offset, books}.
     """
-    filters = filters or {}
-    missing = filters.get("missing") or []
-    # Identifier fields (asin/goodreadsId/…) and description are stripped from the plain
-    # list response — fetch full metadata when the query depends on one of them.
-    need_desc = any(f in _MISSING_FULL_ONLY for f in missing)
-    books = await _all_books(with_description=need_desc)
-
-    if query:
-        ql = query.lower()
-        books = [b for b in books if _matches_query(b, ql)]
-    if filters:
-        books = [b for b in books if _matches_filters(b, filters)]
-
-    books.sort(key=_SORT_KEYS.get(sort, _SORT_KEYS["title"]), reverse=(order == "desc"))
-
-    total = len(books)
-    limit = max(1, min(limit, 200))
-    offset = max(0, offset)
-    page = books[offset : offset + limit]
+    flt = await _search_filter(filters or {})
+    limit = max(1, min(limit, QUERY_PAGE_SIZE_MAX))
+    cards, total = await _books_window(
+        offset=offset, limit=limit, filter=flt, sort=_sort_spec(sort, order), q=query or None
+    )
     return SearchResult(
-        total=total, limit=limit, offset=offset, books=[_summarize_book(b) for b in page]
+        total=total, limit=limit, offset=offset, books=[_summarize_card(c) for c in cards]
     )
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "List authors"})
 async def list_authors(query: str = "", limit: int = 100, offset: int = 0) -> dict:
-    """List authors (from BookLore's authors index) with per-author book counts.
-    Optionally filter by a case-insensitive substring `query`."""
-    authors = await client.get("/api/v1/authors") or []
-    if query:
-        ql = query.lower()
-        authors = [a for a in authors if ql in (a.get("name") or "").lower()]
-    authors.sort(key=lambda a: (a.get("name") or "").lower())
-    page = authors[max(0, offset) : max(0, offset) + max(1, limit)]
+    """List authors with per-author book counts, sorted by name. `query` filters by
+    name (BookOrbit's author search). Returns {total, authors:[{id, name, book_count}]}."""
+
+    async def fetch(page: int, size: int) -> dict[str, Any]:
+        params: dict[str, Any] = {"page": page, "size": size}
+        if query:
+            params["q"] = query
+        return await client.get("/api/v1/authors", params=params)
+
+    rows, total = await _fetch_window(
+        fetch, offset=offset, limit=max(1, min(limit, 500)), max_page_size=100
+    )
     return {
-        "total": len(authors),
+        "total": total,
         "authors": [
             {"id": a.get("id"), "name": a.get("name"), "book_count": a.get("bookCount")}
-            for a in page
+            for a in rows
         ],
     }
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Books by author"})
 async def books_by_author(author: str, limit: int = 50, offset: int = 0) -> SearchResult:
-    """List books by an author (case-insensitive exact match on the author name)."""
-    al = author.lower()
-    matched = [
-        b
-        for b in await _all_books()
-        if any(al == n.lower() for n in _author_names(b.get("metadata") or {}))
-    ]
-    total = len(matched)
-    limit = max(1, limit)
-    offset = max(0, offset)
-    page = matched[offset : offset + limit]
-    return SearchResult(
-        total=total, limit=limit, offset=offset, books=[_summarize_book(b) for b in page]
+    """List books by an author. Matches any author whose name contains `author`
+    (case- and accent-insensitive), so "tolkien" finds "J.R.R. Tolkien". Sorted by
+    publication year, then title."""
+    limit = max(1, min(limit, QUERY_PAGE_SIZE_MAX))
+    cards, total = await _books_window(
+        offset=offset,
+        limit=limit,
+        filter=all_of(rule("author", "includesAny", [author])),
+        sort=[sort_by("publishedYear"), sort_by("title")],
     )
+    return SearchResult(
+        total=total, limit=limit, offset=offset, books=[_summarize_card(c) for c in cards]
+    )
+
+
+async def _count_books(flt: dict[str, Any] | None = None) -> int:
+    page = await client.query_books(build_book_query(filter=flt, size=1))
+    return int(page.get("total") or 0)
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Reading stats"})
 async def get_reading_stats() -> dict:
-    """Library-wide reading stats: counts by read status and average personal rating.
-
-    Note: BookLore's list endpoint exposes readStatus / personalRating sparsely, so
-    most books report as UNSET / unrated here."""
-    books = await _all_books()
-    by_status = Counter((b.get("readStatus") or "UNSET") for b in books)
-    ratings = [b["personalRating"] for b in books if b.get("personalRating") is not None]
-    avg = round(sum(ratings) / len(ratings), 2) if ratings else None
-    return {
-        "total": len(books),
-        "by_status": dict(by_status),
-        "rated_count": len(ratings),
+    """Your reading stats: book counts by read status (they add up to the total;
+    books never marked count as unread), your ratings (count, average and 1-5
+    distribution), and BookOrbit's reading summary (tracked, in progress, completed,
+    mean progress). Counts come from small server-side queries, not a library scan."""
+    status_flts = [all_of(rule("readStatus", "includesAny", [s])) for s in READ_STATUSES]
+    rating_flts = [all_of(rule("rating", "eq", n)) for n in range(1, 6)]
+    total, *counts = await asyncio.gather(
+        _count_books(), *(_count_books(f) for f in status_flts + rating_flts)
+    )
+    by_status = dict(zip(READ_STATUSES, counts[: len(READ_STATUSES)], strict=True))
+    ratings = dict(zip(range(1, 6), counts[len(READ_STATUSES) :], strict=True))
+    rated = sum(ratings.values())
+    avg = round(sum(n * c for n, c in ratings.items()) / rated, 2) if rated else None
+    result: dict[str, Any] = {
+        "total": total,
+        "by_status": by_status,
+        "rated_count": rated,
         "avg_rating": avg,
+        "ratings": ratings,
     }
+    with suppress(BookOrbitError):
+        result["reading"] = await client.get("/api/v1/user-statistics/summary")
+    return result
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Export library"})
 async def export_library(
     format: Literal["json", "csv"] = "json",
-    shelf_id: int | None = None,
+    query: str = "",
+    filters: dict | None = None,
+    collection_id: int | None = None,
+    library_id: int | None = None,
     fields: list[str] | None = None,
     full: bool = False,
     offset: int = 0,
-    limit: int | None = None,
+    limit: int = 500,
+    ctx: Context | None = None,
 ) -> dict:
-    """Export the library (or one shelf) as JSON or CSV.
+    """Export books as JSON or CSV: the whole library, one collection or library, or
+    any search_books `query`/`filters` selection, sorted by title.
 
-    By default returns the trimmed summary (id/title/authors/series/readStatus/
-    personalRating/shelves). To audit metadata completeness, pass `fields` to
-    project a specific set, or `full=True` for every field. Selectable fields:
-    id, title, subtitle, authors, series, seriesNumber, publisher, publishedDate,
-    language, pageCount, isbn10, isbn13, asin, goodreadsId, googleId, hardcoverId,
-    amazonRating, goodreadsRating, personalRating, readStatus, tags, categories,
-    description, shelves. Identifier fields (asin/goodreadsId/…) and description are
-    fetched on demand.
+    Default columns: id, title, authors, series, readStatus, rating, genres, tags.
+    Pass `fields` to choose columns, or `full=True` for all of them: id, title,
+    subtitle, authors, series, seriesIndex, publisher, publishedDate, publishedYear,
+    language, pageCount, isbn13, hardcoverId, genres, tags, narrators, rating,
+    readStatus, readingProgress, formats, addedAt, metadataScore, lockedFields,
+    libraryId. (Descriptions and per-provider ids are only on get_book.)
 
-    A full-library export easily exceeds the response token limit, so: prefer `csv`
-    (far more compact than JSON), keep `fields` narrow, and page with `offset`/`limit`
-    (the response reports `total` so you know how many pages remain). JSON output is
-    compact (no indentation). Returns {format, total, offset, limit, returned, fields,
-    content}.
+    Large exports can exceed the response size limit, so prefer `csv`, keep `fields`
+    narrow, and page with `offset`/`limit` (max 5000 per call); `total` says how many
+    books match. Returns {format, total, offset, limit, returned, fields, content}.
     """
     if fields:
         bad = sorted(set(fields) - set(_EXPORT_FIELDS))
@@ -1429,21 +1484,20 @@ async def export_library(
     elif full:
         cols = list(_EXPORT_FIELDS)
     else:
-        cols = ["id", "title", "authors", "series", "readStatus", "personalRating", "shelves"]
+        cols = list(_EXPORT_DEFAULT_FIELDS)
+    limit = max(1, min(limit, EXPORT_LIMIT_MAX))
 
-    need_desc = any(c in _FULL_ONLY_FIELDS for c in cols)
-    if shelf_id is not None:
-        books = await client.get(f"/api/v1/shelves/{shelf_id}/books") or []
-        if need_desc:  # shelf endpoint returns list-trimmed records; hydrate by id
-            full_by_id = {b.get("id"): b for b in await _all_books(with_description=True)}
-            books = [full_by_id.get(b.get("id"), b) for b in books]
-    else:
-        books = await _all_books(with_description=need_desc)
-
-    total = len(books)
-    offset = max(0, offset)
-    page = books[offset : offset + limit] if limit is not None else books[offset:]
-    rows = [{c: _EXPORT_FIELDS[c](b) for c in cols} for b in page]
+    cards, total = await _books_window(
+        offset=offset,
+        limit=limit,
+        filter=await _search_filter(filters or {}),
+        q=query or None,
+        sort=[sort_by("title")],
+        library_id=library_id,
+        collection_id=collection_id,
+        ctx=ctx,
+    )
+    rows = [{c: _EXPORT_FIELDS[c](card) for c in cols} for card in cards]
 
     if format == "json":
         content = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
@@ -1612,6 +1666,137 @@ async def set_field_locks(
     )
 
 
+# ---- Metadata lookups ------------------------------------------------------
+
+_METADATA_STREAM_PATH = "/api/v1/metadata-fetch/stream"
+# External providers can be slow; the stream ends when every provider has answered.
+METADATA_STREAM_TIMEOUT = 180.0
+# Named SSE event BookOrbit uses for a provider that timed out, was throttled or failed.
+_PROVIDER_STATUS_EVENT = "provider-status"
+
+
+async def _stream_metadata_search(params: dict[str, Any]) -> tuple[list[dict], dict[str, str]]:
+    """Read BookOrbit's metadata search stream (server-sent events) to the end.
+
+    Unnamed events are candidates, one per provider match. `provider-status` events
+    name a provider whose search timed out, was throttled or failed. Returns
+    (candidates, {provider: outcome}).
+    """
+    candidates: list[dict] = []
+    failures: dict[str, str] = {}
+    event: str | None = None
+    data: list[str] = []
+
+    def dispatch() -> None:
+        if not data:
+            return
+        with suppress(json.JSONDecodeError):
+            payload = json.loads("\n".join(data))
+            if not isinstance(payload, dict):
+                return
+            if event == _PROVIDER_STATUS_EVENT:
+                if payload.get("provider"):
+                    failures[str(payload["provider"])] = str(payload.get("outcome") or "failed")
+            else:
+                candidates.append(payload)
+
+    headers = {**client.auth_headers(), "Accept": "text/event-stream"}
+    try:
+        async with client._http.stream(
+            "GET",
+            _METADATA_STREAM_PATH,
+            params=params,
+            headers=headers,
+            timeout=METADATA_STREAM_TIMEOUT,
+        ) as resp:
+            if resp.status_code >= 400:
+                await resp.aread()
+                raise _api_error("GET", _METADATA_STREAM_PATH, resp)
+            async for line in resp.aiter_lines():
+                if not line:
+                    dispatch()
+                    event, data = None, []
+                    continue
+                if line.startswith(":"):
+                    continue
+                name, _, value = line.partition(":")
+                value = value[1:] if value.startswith(" ") else value
+                if name == "event":
+                    event = value
+                elif name == "data":
+                    data.append(value)
+            dispatch()
+    except httpx.TimeoutException as exc:
+        raise BookOrbitError(
+            "The metadata search timed out: external providers can be slow. "
+            "Try fewer providers or retry."
+        ) from exc
+    except httpx.TransportError as exc:
+        raise BookOrbitError(f"Could not reach BookOrbit at {client._base_url}: {exc}") from exc
+    return candidates, failures
+
+
+async def _search_metadata(params: dict[str, Any], providers: list[str] | None) -> dict:
+    """Search the enabled metadata providers and report each one's outcome."""
+    rows = await client.get("/api/v1/metadata-fetch/providers") or []
+    enabled = [str(r["key"]) for r in rows if isinstance(r, dict) and r.get("key")]
+    requested = list(dict.fromkeys(providers)) if providers else enabled
+    active = [p for p in requested if p in enabled]
+
+    candidates: list[dict] = []
+    failures: dict[str, str] = {}
+    if active:
+        candidates, failures = await _stream_metadata_search(
+            {**params, "providers": ",".join(active)}
+        )
+
+    counts = Counter(str(c.get("provider")) for c in candidates)
+    statuses: list[dict[str, Any]] = []
+    for p in requested:
+        if p not in enabled:
+            statuses.append(
+                {
+                    "provider": p,
+                    "status": "disabled",
+                    "count": 0,
+                    "reason": "not enabled on this server. "
+                    f"Enabled: {', '.join(enabled) or 'none'}.",
+                }
+            )
+        elif p in failures:
+            statuses.append({"provider": p, "status": failures[p], "count": counts[p]})
+        elif counts[p]:
+            statuses.append({"provider": p, "status": "ok", "count": counts[p]})
+        else:
+            statuses.append(
+                {"provider": p, "status": "empty", "count": 0, "reason": "ran and found no match"}
+            )
+    return {
+        "providers": requested,
+        "provider_status": statuses,
+        "count": len(candidates),
+        "candidates": candidates,
+    }
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+        "title": "Look up metadata by ISBN",
+    }
+)
+async def isbn_lookup(isbn: str, providers: list[str] | None = None) -> dict:
+    """Look up an ISBN with BookOrbit's metadata providers (Google Books, Goodreads,
+    Amazon, OpenLibrary, ... whichever are enabled on the server). Read-only: changes
+    no book. `providers` limits the search to some provider keys (lowercase, e.g.
+    ["google", "openLibrary"]); by default every enabled provider is asked.
+    Returns {isbn, providers, provider_status, count, candidates} — see
+    fetch_metadata_candidates for what provider_status means."""
+    return {"isbn": isbn, **await _search_metadata({"isbn": isbn}, providers)}
+
+
 @mcp.tool(
     annotations={"readOnlyHint": True, "openWorldHint": True, "title": "Fetch metadata candidates"}
 )
@@ -1622,138 +1807,26 @@ async def fetch_metadata_candidates(
     title: str | None = None,
     author: str | None = None,
 ) -> dict:
-    """Fetch candidate metadata for a book from external providers — read-only, does
-    NOT modify the book.
+    """Fetch candidate metadata for a book from external providers. Read-only: it
+    does NOT change the book.
 
-    `providers` is any of: Amazon, GoodReads, Google, Hardcover, Comicvine, Douban,
-    Lubimyczytac, Ranobedb, Audible (defaults to Google, GoodReads, Amazon). When you
-    pass none of `isbn`/`title`/`author`, the book's stored ISBN/title/author are used
-    as the query automatically — so book_id alone works.
+    With just `book_id`, BookOrbit searches using the book's own stored metadata and
+    provider ids. Pass `isbn`, `title` or `author` to search with other terms.
+    `providers` limits the search to some provider keys (lowercase, e.g. ["google",
+    "goodreads", "amazon"]); by default every enabled provider is asked. Each
+    candidate carries its `provider`, `providerId` and that provider's fields.
 
-    Each candidate is a full BookMetadata object carrying that provider's own fields:
-    Amazon supplies asin/amazonRating, GoodReads supplies goodreadsId/goodreadsRating,
-    Google supplies googleId — so to fill a given field you must include the provider
-    that owns it. Review the candidates, then apply one with update_book_metadata
-    (lock curated fields first with set_field_locks).
-
-    `provider_status` reports each requested provider as ok (n candidates), empty (the
-    provider ran but returned nothing — blocked, rate-limited, mis-regioned, or no
-    match), or disabled (turned off in BookLore Settings > Metadata 1). This makes a dead
-    provider distinguishable from a genuine no-match, which the raw stream cannot. An entry
-    may also include `disabled_fields` — provider-specific fields (e.g. goodreadsRating)
-    toggled off in Settings > Metadata 2, which auto-fetch won't persist library-wide even
-    when the provider works.
+    `provider_status` reports each requested provider as: ok (n candidates), empty
+    (ran but found no match), timeout / throttled / failed (the provider's search
+    broke, so its silence is not a real no-match), or disabled (not enabled on this
+    server, or not a provider key). Returns {book_id, providers, provider_status,
+    count, candidates}.
     """
-    provs = providers or ["Google", "GoodReads", "Amazon"]
-
-    # P1: default the search terms from the book's own stored metadata when the caller
-    # passes none — the backend otherwise falls back only to the filename, so book_id
-    # alone yields nothing useful.
-    query = {"isbn": isbn, "title": title, "author": author}
-    if not any(query.values()):
-        with suppress(BookOrbitError):
-            book = await client.get(f"/api/v1/books/{book_id}", params={"withDescription": "false"})
-            meta = book.get("metadata") or {}
-            names = _author_names(meta)
-            query = {
-                "isbn": meta.get("isbn13") or meta.get("isbn10"),
-                "title": book.get("title") or meta.get("title"),
-                "author": names[0] if names else None,
-            }
-
-    auth = client.auth_headers()
-    body = {"bookId": book_id, "providers": provs, **query}
-
-    candidates: list[dict] = []
-    try:
-        async with client._http.stream(
-            "POST",
-            f"/api/v1/books/{book_id}/metadata/prospective",
-            json=body,
-            headers={**auth, "Accept": "text/event-stream"},
-            timeout=180.0,
-        ) as resp:
-            if resp.status_code >= 400:
-                detail = (await resp.aread()).decode("utf-8", "replace")
-                raise BookOrbitError(f"prospective metadata -> {resp.status_code}: {detail}")
-            async for line in resp.aiter_lines():
-                if line.startswith("data:"):
-                    payload = line[len("data:") :].strip()
-                    if payload:
-                        with suppress(json.JSONDecodeError):
-                            candidates.append(json.loads(payload))
-    except httpx.TimeoutException as exc:
-        raise BookOrbitError(
-            f"Fetching candidates for book {book_id} timed out — external providers "
-            f"can be slow. Try fewer providers or retry."
-        ) from exc
-
-    # P0: derive per-provider status. The backend swallows provider errors (emits nothing
-    # for a failed provider), so we infer status from result counts, enriched with the
-    # provider config when readable (disabled provider, Amazon cookie, field toggles).
-    settings = await _app_settings()
-    queried = bool(query.get("isbn") or query.get("title"))
-    counts: Counter[str] = Counter(str(p) for c in candidates if (p := c.get("provider")))
-    provider_status = [_provider_status(p, counts.get(p, 0), settings, queried) for p in provs]
-
-    return {
-        "book_id": book_id,
-        "query": query,
-        "providers": provs,
-        "provider_status": provider_status,
-        "count": len(candidates),
-        "candidates": candidates,
-    }
-
-
-def _provider_status(provider: str, count: int, settings: dict | None, queried: bool) -> dict:
-    """Classify one requested provider's outcome as ok / empty / disabled, and note any of
-    its provider-specific fields (ratings/ids) that are toggled off — those stay empty
-    library-wide even when the provider returns candidates."""
-    prov_cfg = (settings or {}).get("metadataProviderSettings") or {}
-    field_cfg = (settings or {}).get("metadataProviderSpecificFields") or {}
-    cfg = prov_cfg.get(_PROVIDER_SETTINGS_KEY.get(provider, ""), {}) or {}
-
-    # Provider-specific fields explicitly disabled (only meaningful if we could read settings).
-    disabled_fields = (
-        [f for f in _PROVIDER_SPECIFIC_FIELDS.get(provider, []) if field_cfg.get(f) is False]
-        if settings is not None
-        else []
-    )
-
-    if settings is not None and _PROVIDER_SETTINGS_KEY.get(provider) and not cfg.get("enabled"):
-        result = {
-            "provider": provider,
-            "status": "disabled",
-            "count": 0,
-            "reason": "provider is disabled in BookLore Settings > Metadata 1.",
-        }
-    elif count:
-        result = {"provider": provider, "status": "ok", "count": count}
-    else:
-        # Enabled (or unknown) but produced nothing. A real query that still returns zero is
-        # far more likely a blocked/broken scraper than a true no-match.
-        if queried:
-            reason = (
-                "enabled but returned 0 candidates for a real query — likely blocked, "
-                "rate-limited, mis-regioned, or the provider's scraper is broken "
-                "server-side (the backend logs the error but the API does not expose it)."
-            )
-        else:
-            reason = (
-                "no candidates — no usable search terms (pass isbn/title or set them on the book)."
-            )
-        if provider == "Amazon" and not cfg.get("cookie"):
-            reason += " Amazon often needs a session cookie/region (Settings > Metadata 1)."
-        result = {"provider": provider, "status": "empty", "count": 0, "reason": reason}
-
-    if disabled_fields:
-        result["disabled_fields"] = disabled_fields
-        result["fields_note"] = (
-            f"these fields are toggled OFF in Settings > Metadata 2, so auto-fetch won't "
-            f"persist them library-wide: {', '.join(disabled_fields)}."
-        )
-    return result
+    params: dict[str, Any] = {"bookId": book_id}
+    for key, value in (("isbn", isbn), ("title", title), ("author", author)):
+        if value:
+            params[key] = value
+    return {"book_id": book_id, **await _search_metadata(params, providers)}
 
 
 @mcp.tool(annotations={"idempotentHint": True, "title": "Add books to shelves"})
@@ -1808,113 +1881,177 @@ async def bulk_set_read_status(items: list[dict], ctx: Context | None = None) ->
     return {"updated": updated, "by_status": by_status, "failed": failed}
 
 
-# Duplicate-detection signal presets (BookLore exposes no presets server-side).
-_DUP_SIGNALS = (
-    "matchByIsbn",
-    "matchByExternalId",
-    "matchByTitleAuthor",
-    "matchByDirectory",
-    "matchByFilename",
-)
-_DUP_PRESETS = {
-    "strict": {"matchByIsbn", "matchByExternalId"},
-    "balanced": {"matchByIsbn", "matchByExternalId", "matchByTitleAuthor"},
-    "aggressive": set(_DUP_SIGNALS),
+# Duplicate scans (BookOrbit v3.8.0 book-duplicates module).
+_DUP_REASONS = {
+    "duplicate": ("file_hash", "isbn", "exact_metadata", "fuzzy_metadata"),
+    "other_format": ("same_work", "title_author", "series_position"),
 }
+_DUP_GROUPS_PAGE_SIZE = 50
+# Seconds between scan status checks while waiting for a scan to finish.
+DUP_POLL_INTERVAL = 2.0
 
 
-@mcp.tool(annotations={"readOnlyHint": True, "title": "Find duplicates"})
+def _dup_scan_summary(scan: dict) -> dict:
+    return {
+        "scan_id": scan.get("id"),
+        "status": scan.get("status"),
+        "library_ids": scan.get("libraryIds"),
+        "similarity_percent": scan.get("similarityPercent"),
+        "progress_percent": scan.get("progressPercent"),
+        "total_groups": scan.get("totalGroups"),
+        "total_other_format_pairs": scan.get("totalOtherFormatPairs"),
+        "total_reclaimable_bytes": scan.get("totalReclaimableBytes"),
+    }
+
+
+def _dup_group(group: dict) -> dict:
+    books = [b for b in group.get("books") or [] if isinstance(b, dict)]
+    isbns = {b.get("isbn13") or b.get("isbn10") for b in books} - {None}
+    return {
+        "id": group.get("id"),
+        "kind": group.get("kind"),
+        "reasons": group.get("reasons") or [],
+        "max_title_similarity": group.get("maxTitleSimilarity"),
+        "reclaimable_bytes": group.get("reclaimableBytes"),
+        "distinct_isbns": len(isbns) > 1,
+        "books": [
+            {
+                "id": b.get("id"),
+                "title": b.get("title"),
+                "authors": b.get("authors") or [],
+                "isbn13": b.get("isbn13"),
+                "isbn10": b.get("isbn10"),
+                "formats": sorted(
+                    {f.get("format") for f in b.get("files") or [] if f.get("format")}
+                ),
+                "library": b.get("libraryName"),
+                "metadata_score": b.get("metadataScore"),
+            }
+            for b in books
+        ],
+    }
+
+
+@mcp.tool(annotations={"destructiveHint": False, "title": "Find duplicates"})
 async def find_duplicates(
     library_id: int | None = None,
-    preset: Literal["strict", "balanced", "aggressive"] = "balanced",
-    signals: dict | None = None,
+    similarity_percent: int = 90,
+    kind: Literal["duplicate", "other_format"] = "duplicate",
+    reason: str | None = None,
+    max_groups: int = 50,
+    scan_id: int | None = None,
+    wait_seconds: float = 120,
+    ctx: Context | None = None,
 ) -> dict:
-    """Find duplicate books using BookLore's native detection — read-only, merges nothing.
+    """Find duplicate books with BookOrbit's duplicate scanner. It never merges or
+    deletes anything: it only reports groups.
 
-    Detection is per-library; omit `library_id` to scan every library. `preset` picks
-    the signal set: strict (ISBN + external id), balanced (+ title/author), aggressive
-    (+ same-directory + filename). `signals` overrides individual flags, e.g.
-    {"matchByFilename": true}. Each group reports the suggested merge target, the match
-    reason, the books, and `distinct_isbns` (true ⇒ the books carry different ISBNs, so
-    likely separate editions rather than true duplicates).
-    Returns {libraries_scanned, group_count, groups}.
+    Runs (or reuses) a scan over one library or, by default, every library you can
+    access, then lists its groups. `kind` "duplicate" finds copies of the same book
+    (reasons: file_hash, isbn, exact_metadata, fuzzy_metadata); "other_format" finds
+    the same work in another format (same_work, title_author, series_position).
+    `reason` narrows to one reason. `similarity_percent` (70-100) sets how close
+    fuzzy title matches must be. Each group lists its books and `distinct_isbns`
+    (true means the books carry different ISBNs: likely separate editions).
+
+    A scan runs in the background. If it is still running after `wait_seconds`, this
+    returns status "running" and its scan_id: call again with that `scan_id` to
+    collect the result. Needs an API key with read-and-write access and the
+    library_delete_books permission (BookOrbit gates the scanner behind it).
     """
-    flags = {s: (s in _DUP_PRESETS[preset]) for s in _DUP_SIGNALS}
-    if signals:
-        bad = sorted(set(signals) - set(_DUP_SIGNALS))
-        if bad:
-            raise BookOrbitError(
-                f"Unknown duplicate signal(s): {', '.join(bad)}. Valid: {', '.join(_DUP_SIGNALS)}."
-            )
-        flags.update({k: bool(v) for k, v in signals.items()})
+    if not 70 <= similarity_percent <= 100:
+        raise BookOrbitError("similarity_percent must be between 70 and 100.")
+    if reason is not None and reason not in _DUP_REASONS[kind]:
+        raise BookOrbitError(
+            f"reason {reason!r} does not apply to kind {kind!r}. "
+            f"Valid: {', '.join(_DUP_REASONS[kind])}."
+        )
+    max_groups = max(1, max_groups)
 
-    if library_id is not None:
-        library_ids: list[int] = [library_id]
+    reused = False
+    if scan_id is not None:
+        scan = await client.get(f"/api/v1/book-duplicates/scans/{scan_id}")
     else:
-        libs = await client.get("/api/v1/libraries") or []
-        library_ids = [
-            lib["id"] for lib in libs if isinstance(lib, dict) and lib.get("id") is not None
-        ]
+        scan = await client.get("/api/v1/book-duplicates/scans/active")
+        reused = bool(scan)
+        if not scan:
+            body: dict[str, Any] = {"similarityPercent": similarity_percent}
+            if library_id is not None:
+                body["libraryId"] = library_id
+            scan = await client.post("/api/v1/book-duplicates/scans", json=body)
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, wait_seconds)
+    while scan.get("status") in ("queued", "running"):
+        if ctx is not None and scan.get("progressPercent") is not None:
+            await ctx.report_progress(progress=scan["progressPercent"], total=100)
+        if loop.time() >= deadline:
+            return {
+                **_dup_scan_summary(scan),
+                "reused_active_scan": reused,
+                "message": f"Scan still running: call find_duplicates(scan_id={scan.get('id')}) "
+                "again to collect the groups.",
+            }
+        await asyncio.sleep(DUP_POLL_INTERVAL)
+        scan = await client.get(f"/api/v1/book-duplicates/scans/{scan['id']}")
+
+    if scan.get("status") != "completed":
+        raise BookOrbitError(
+            f"Duplicate scan {scan.get('id')} {scan.get('status')}"
+            + (f" ({scan['errorCode']})" if scan.get("errorCode") else "")
+            + "."
+        )
 
     groups: list[dict] = []
-    for lib_id in library_ids:
-        result = (
-            await client.post("/api/v1/books/duplicates", json={"libraryId": lib_id, **flags}) or []
+    total = 0
+    page = 1  # this endpoint's pages start at 1
+    while len(groups) < max_groups:
+        params: dict[str, Any] = {"page": page, "pageSize": _DUP_GROUPS_PAGE_SIZE, "kind": kind}
+        if reason:
+            params["reason"] = reason
+        result = await client.get(
+            f"/api/v1/book-duplicates/scans/{scan['id']}/groups", params=params
         )
-        for grp in result:
-            books = grp.get("books") or []
-            isbns = {(_meta(b).get("isbn13") or _meta(b).get("isbn10")) for b in books}
-            isbns.discard(None)
-            groups.append(
-                {
-                    "library_id": lib_id,
-                    "match_reason": grp.get("matchReason"),
-                    "suggested_target_book_id": grp.get("suggestedTargetBookId"),
-                    "distinct_isbns": len(isbns) > 1,
-                    "books": [
-                        {
-                            "id": b.get("id"),
-                            "title": b.get("title") or _meta(b).get("title"),
-                            "authors": _author_names(_meta(b)),
-                            "isbn13": _meta(b).get("isbn13"),
-                            "isbn10": _meta(b).get("isbn10"),
-                        }
-                        for b in books
-                    ],
-                }
-            )
-    return {"libraries_scanned": len(library_ids), "group_count": len(groups), "groups": groups}
+        batch = result.get("groups") or []
+        total = int(result.get("total") or 0)
+        groups.extend(_dup_group(g) for g in batch)
+        if len(batch) < _DUP_GROUPS_PAGE_SIZE or len(groups) >= total:
+            break
+        page += 1
+    groups = groups[:max_groups]
+    return {
+        **_dup_scan_summary(scan),
+        "reused_active_scan": reused,
+        "kind": kind,
+        "group_count": total,
+        "returned": len(groups),
+        "groups": groups,
+    }
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "List libraries"})
 async def list_libraries() -> list[dict]:
-    """List BookLore libraries and their on-disk paths.
-
-    Files are ingested into a library *path* on the BookLore host (e.g. by dropping
-    them into a watched folder); this surfaces each library's id, name, whether it's
-    watched, its paths (id + filesystem path), and allowed formats — the context you
-    need to know where a manually-added book will land and which library to rescan.
-    Returns [{id, name, watch, paths:[{id, path}], allowed_formats}].
-    """
+    """List your BookOrbit libraries: id, name, book count, whether its folders are
+    watched for new files, its folders on the server (id + path), and allowed
+    formats. Use it to see where a manually added file lands and which library to
+    rescan, or to get ids for search_books' library_ids filter."""
     libs = await client.get("/api/v1/libraries") or []
-    out: list[dict] = []
-    for lib in libs:
-        if not isinstance(lib, dict):
-            continue
-        out.append(
-            {
-                "id": lib.get("id"),
-                "name": lib.get("name"),
-                "watch": lib.get("watch"),
-                "paths": [
-                    {"id": p.get("id"), "path": p.get("path")}
-                    for p in (lib.get("paths") or [])
-                    if isinstance(p, dict)
-                ],
-                "allowed_formats": lib.get("allowedFormats"),
-            }
-        )
-    return out
+    return [
+        {
+            "id": lib.get("id"),
+            "name": lib.get("name"),
+            "book_count": lib.get("bookCount"),
+            "watch": lib.get("watch"),
+            "paths": [
+                {"id": f.get("id"), "path": f.get("path")}
+                for f in (lib.get("folders") or [])
+                if isinstance(f, dict)
+            ],
+            "allowed_formats": lib.get("allowedFormats"),
+        }
+        for lib in libs
+        if isinstance(lib, dict)
+    ]
 
 
 @mcp.tool(annotations={"idempotentHint": True, "openWorldHint": True, "title": "Refresh library"})

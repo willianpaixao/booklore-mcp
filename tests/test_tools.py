@@ -17,22 +17,6 @@ import server
 BASE = "http://bookorbit.test"
 
 
-async def test_list_books_filters_and_limits(authed):
-    books = [
-        {"id": 1, "title": "The Hobbit", "metadata": {"authors": [{"name": "J.R.R. Tolkien"}]}},
-        {"id": 2, "title": "Dune", "metadata": {"authors": [{"name": "Frank Herbert"}]}},
-    ]
-    authed.get(f"{BASE}/api/v1/books").mock(return_value=httpx.Response(200, json=books))
-
-    async with Client(server.mcp) as mcp_client:
-        result = await mcp_client.call_tool("list_books", {"query": "tolkien"})
-
-    # list_books returns list[BookSummary]; FastMCP deserializes structured
-    # output into model objects, so fields are attributes, not dict keys.
-    assert len(result.data) == 1
-    assert result.data[0].id == 1
-
-
 async def test_update_metadata_always_sends_clear_flags(authed):
     route = authed.put(f"{BASE}/api/v1/books/5/metadata").mock(
         return_value=httpx.Response(200, json={"title": "X"})
@@ -132,33 +116,6 @@ async def test_delete_shelf_returns_confirmation(authed):
         result = await mcp_client.call_tool("delete_shelf", {"shelf_id": 3})
 
     assert "Deleted shelf 3" in result.data
-
-
-async def test_list_libraries_trims_fields(authed):
-    libs = [
-        {
-            "id": 1,
-            "name": "Ebooks",
-            "watch": True,
-            "paths": [{"id": 10, "libraryId": 1, "path": "/data/ebooks"}],
-            "allowedFormats": ["EPUB", "PDF"],
-            "metadataSource": "EMBEDDED",
-        }
-    ]
-    authed.get(f"{BASE}/api/v1/libraries").mock(return_value=httpx.Response(200, json=libs))
-
-    async with Client(server.mcp) as mcp_client:
-        result = await mcp_client.call_tool("list_libraries", {})
-
-    assert result.data == [
-        {
-            "id": 1,
-            "name": "Ebooks",
-            "watch": True,
-            "paths": [{"id": 10, "path": "/data/ebooks"}],
-            "allowed_formats": ["EPUB", "PDF"],
-        }
-    ]
 
 
 async def test_refresh_library_triggers_rescan(authed):

@@ -12,23 +12,23 @@ a BookOrbit [API key](#configure-the-api-key).
 
 | Tool | Kind | What it does |
 |---|---|---|
-| `search_books` | read | Search/filter the library (tags, categories, authors, shelves, **missing fields**), sorted + paginated |
-| `list_books` | read | List/search books (trimmed summaries) |
-| `get_book` | read | Full record + metadata for one book |
-| `list_shelves` | read | All shelves |
-| `get_shelf_books` | read | Books on a shelf |
-| `get_recommendations` | read | Books similar to a given one |
-| `list_authors` | read | Distinct authors with per-author book counts |
-| `books_by_author` | read | Books by a given author |
-| `get_reading_stats` | read | Counts by read status + average rating |
-| `export_library` | read | Export the library (or a shelf) as JSON or CSV; `fields` projection or `full=True` for ISBN/ASIN/ratings/IDs |
-| `find_duplicates` | read | Group duplicate books via BookLore's native detection (presets + per-signal control) |
-| `list_libraries` | read | List libraries and their on-disk paths (id, name, watch, paths, allowed formats) |
+| `search_books` | read | Search/filter on the server (free text, tags, genres, authors, collections, libraries, read status, **missing fields**), sorted + paginated |
+| `list_books` | read | List books or run a quick free-text search (trimmed summaries) |
+| `get_book` | read | Full record for one book (metadata, files, collections, provider ids, ratings) |
+| `list_collections` | read | Your collections and public ones, with book counts |
+| `get_collection_books` | read | Books in a collection, in collection order, paginated |
+| `get_recommendations` | read | Related books: similar, same series, or same author |
+| `list_authors` | read | Authors with per-author book counts, searchable |
+| `books_by_author` | read | Books by an author (name substring) |
+| `get_reading_stats` | read | Counts by read status, your rating distribution and average, reading summary |
+| `export_library` | read | Export books (all, a collection, a library, or a search) as JSON or CSV; `fields` projection or `full=True` |
+| `find_duplicates` | scan | Run (or reuse) BookOrbit's duplicate scan and list duplicate / other-format groups; merges nothing |
+| `list_libraries` | read | Libraries with book counts, folders on the server and allowed formats |
 | `refresh_library` | write | Rescan a library's paths so BookLore ingests files added on disk |
 | `bookdrop_rescan` | write | Rescan BookLore's bookdrop folder for newly added files (staged for review) |
-| `ping` | read | Liveness + auth probe (down vs. logged-out), server version, counts |
-| `isbn_lookup` | read | Fetch metadata for an ISBN from external providers |
-| `fetch_metadata_candidates` | read | Fetch candidate metadata from external providers (review, then apply); per-provider status |
+| `ping` | read | Liveness + API-key probe (down vs. key rejected), user, key permissions, server version, counts |
+| `isbn_lookup` | read | Look up an ISBN with the server's metadata providers; per-provider status |
+| `fetch_metadata_candidates` | read | Candidate metadata for a book from external providers (review, then apply); per-provider status |
 | `add_tags` / `remove_tags` | write | Add/remove tags on a book (merge, idempotent) |
 | `add_categories` / `remove_categories` | write | Add/remove categories (merge, idempotent) |
 | `bulk_update_metadata` | write | Apply per-book patches to many books — tags/categories, arbitrary fields, clears (partial-success) |
@@ -44,9 +44,10 @@ a BookOrbit [API key](#configure-the-api-key).
 | `set_reading_progress` | write | Record reading position / % for a book file |
 | `reset_progress` | write | Clear reading progress (destructive) |
 
-For bulk tagging/enrichment, prefer `search_books` (especially the `missing` filter —
-now covering identifier/rating fields like `asin`/`goodreadsId`/`amazonRating`, with a
-`missing_mode: any` for "lacking at least one") to find un-enriched books, plus the
+For bulk tagging/enrichment, prefer `search_books` (especially the `missing` filter,
+which runs on the server and covers fields like `isbn`, `description`, `genres` and
+per-provider community ratings such as `amazonRating`, with `missing_mode: any` for
+"lacking at least one") to find un-enriched books, plus the
 additive `add_tags`/`add_categories` and `bulk_update_metadata` — they merge by default
 and touch only the fields they manage. `update_book_metadata` defaults to
 `REPLACE_WHEN_PROVIDED` (writes only the fields you include, leaving the rest intact) —
@@ -55,15 +56,14 @@ touching the others. Its `REPLACE_ALL` mode replaces the **whole** record (any f
 omit is wiped to null), so reserve it for deliberate full-record edits, and lock curated
 fields with `set_field_locks` first.
 
-`fetch_metadata_candidates` and `isbn_lookup` depend on BookLore's external metadata
-providers (Google, GoodReads, Amazon, …) being reachable and configured on your server.
-`fetch_metadata_candidates` defaults its search terms from the book's own stored
-metadata (so `book_id` alone works) and returns a `provider_status` for each requested
-provider — `ok` / `empty` / `disabled` — so a dead or unconfigured provider (e.g. Amazon
-without a session cookie) is distinguishable from a genuine no-match. Each candidate
-carries only its own provider's fields (Amazon → `asin`/`amazonRating`, GoodReads →
-`goodreadsId`/`goodreadsRating`, Google → `googleId`), so include the provider that owns
-the field you want to fill.
+`fetch_metadata_candidates` and `isbn_lookup` use the metadata providers enabled on
+your BookOrbit server (Google Books, Goodreads, Amazon, OpenLibrary, …). With only a
+`book_id`, `fetch_metadata_candidates` searches with the book's own stored metadata.
+Both return a `provider_status` for each requested provider: `ok`, `empty` (ran, no
+match), `timeout` / `throttled` / `failed` (the provider broke, so its silence is not a
+real no-match) or `disabled` (not enabled on the server). Each candidate carries only
+its own provider's fields, so include the provider that owns the field you want to
+fill.
 
 ## Setup
 
