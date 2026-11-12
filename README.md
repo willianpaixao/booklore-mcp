@@ -26,6 +26,13 @@ a BookOrbit [API key](#configure-the-api-key).
 | `list_libraries` | read | Libraries with book counts, folders on the server and allowed formats |
 | `refresh_library` | write | Scan a library's folders to import files added on disk; optionally wait and report added/updated/missing |
 | `book_dock_rescan` | write | Rescan the book dock (drop folder) for new files awaiting review |
+| `list_series` / `get_series_books` | read | Series with your progress, missing volumes and next book; books in a series in reading order |
+| `list_smart_scopes` / `get_smart_scope_books` | read | Saved searches (smart scopes) and the books they currently match |
+| `get_library_statistics` | read | Library reports: totals, genre/language/format distributions, top authors/series, metadata completeness, growth over time, … |
+| `get_reading_statistics` | read | Your reading reports: daily reading, heatmap, peak hours, pace, completions, time per genre, … |
+| `get_reading_history` | read | Your read-throughs with dates and outcomes, period summaries, and a book's session stats |
+| `get_annotations` | read | Your highlights, notes and bookmarks in a book |
+| `refresh_metadata` | write | Re-fetch books' metadata from providers: preview by default, apply with `preview=False` (respects locks) |
 | `ping` | read | Liveness + API-key probe (down vs. key rejected), user, key permissions, server version, counts |
 | `isbn_lookup` | read | Look up an ISBN with the server's metadata providers; per-provider status |
 | `fetch_metadata_candidates` | read | Candidate metadata for a book from external providers (review, then apply); per-provider status |

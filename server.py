@@ -532,17 +532,23 @@ class BookOrbitClient:
         *,
         library_id: int | None = None,
         collection_id: int | None = None,
+        smart_scope_id: int | None = None,
     ) -> dict[str, Any]:
         """Run one `BookQuery` and return the `BooksPage` (`items`, `total`, `page`,
-        `size`). Scope it to one library or one collection, or neither (all books
-        the key can see). Build `query` with `build_book_query`, which validates it:
-        the server answers a malformed query with a bare 400."""
-        if library_id is not None and collection_id is not None:
-            raise BookOrbitError("Scope a query to a library or a collection, not both.")
+        `size`). Scope it to one library, collection or smart scope, or none (all
+        books the key can see). Build `query` with `build_book_query`, which
+        validates it: the server answers a malformed query with a bare 400."""
+        scopes = [x for x in (library_id, collection_id, smart_scope_id) if x is not None]
+        if len(scopes) > 1:
+            raise BookOrbitError(
+                "Scope a query to one library, collection or smart scope, not several."
+            )
         if library_id is not None:
             path = f"/api/v1/libraries/{library_id}/books"
         elif collection_id is not None:
             path = f"/api/v1/collections/{collection_id}/books/query"
+        elif smart_scope_id is not None:
+            path = f"/api/v1/smart-scopes/{smart_scope_id}/books/query"
         else:
             path = "/api/v1/books/query"
         return await self.post(path, json=query)
@@ -715,6 +721,7 @@ async def _books_window(
     q: str | None = None,
     library_id: int | None = None,
     collection_id: int | None = None,
+    smart_scope_id: int | None = None,
     ctx: Context | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """A window of BookCards from a (validated) book query; returns (cards, total)."""
@@ -728,7 +735,12 @@ async def _books_window(
             size=size,
             collection_scoped=collection_id is not None,
         )
-        return await client.query_books(query, library_id=library_id, collection_id=collection_id)
+        return await client.query_books(
+            query,
+            library_id=library_id,
+            collection_id=collection_id,
+            smart_scope_id=smart_scope_id,
+        )
 
     return await _fetch_window(
         fetch, offset=offset, limit=limit, max_page_size=QUERY_PAGE_SIZE_MAX, ctx=ctx
@@ -776,6 +788,7 @@ _SEARCH_FILTER_KEYS = (
     "genres",
     "genres_mode",
     "authors",
+    "series",
     "collection_ids",
     "library_ids",
     "read_status",
@@ -808,6 +821,8 @@ async def _search_filter(filters: dict[str, Any]) -> dict[str, Any] | None:
         rules.append(rule("genre", op, list(genres)))
     if authors := filters.get("authors"):
         rules.append(rule("author", "includesAny", list(authors)))
+    if series := filters.get("series"):
+        rules.append(rule("series", "includesAny", list(series)))
     if collection_ids := filters.get("collection_ids"):
         names = await _names_by_id(
             "/api/v1/collections", list(collection_ids), "collection", "list_collections"
@@ -1588,6 +1603,7 @@ async def search_books(
       - tags: [str], tags_mode: "any" (default) | "all" — exact tag names
       - genres: [str], genres_mode: "any" | "all" — exact genre names
       - authors: [str] — any author whose name contains one of these
+      - series: [str] — exact series names (see list_series)
       - collection_ids: [int], library_ids: [int] — from list_collections /
         list_libraries
       - read_status: str or [str] — unread, want_to_read, reading, on_hold, rereading,
@@ -2310,6 +2326,421 @@ async def book_dock_rescan() -> dict:
     with suppress(BookOrbitError):
         result["summary"] = await client.get("/api/v1/book-dock/summary")
     return result
+
+
+# ---- Series, smart scopes, statistics, reading history -----------------------
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "List series"})
+async def list_series(
+    query: str = "",
+    status: Literal["not_started", "in_progress", "complete", "has_gaps"] | None = None,
+    sort: Literal["name", "bookCount", "lastAddedAt", "readProgress", "relevance"] = "name",
+    order: Literal["asc", "desc"] = "asc",
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    """List series with your progress in each: how many books you own, have read and
+    are reading, missing volumes (`gaps`), and the next book to read. `status`
+    narrows to series you haven't started, are in the middle of, have finished, or
+    that have gaps. Returns {total, series:[...]}; use get_series_books for the
+    books in one series."""
+
+    async def fetch(page: int, size: int) -> dict[str, Any]:
+        params: dict[str, Any] = {"page": page, "size": size, "sort": sort, "order": order}
+        if query:
+            params["q"] = query
+        if status:
+            params["completionStatus"] = status
+        return await client.get("/api/v1/series", params=params)
+
+    rows, total = await _fetch_window(
+        fetch, offset=offset, limit=max(1, min(limit, 500)), max_page_size=100
+    )
+    series = []
+    for s in rows:
+        entry = {
+            "id": s.get("id"),
+            "name": s.get("name"),
+            "authors": s.get("authors") or [],
+            "book_count": s.get("bookCount"),
+            "read_count": s.get("readCount"),
+            "reading_count": s.get("readingCount"),
+            "expected_book_count": s.get("expectedBookCount"),
+            "gaps": s.get("gaps") or [],
+        }
+        if s.get("nextBookId") is not None:
+            entry["next"] = {
+                "book_id": s.get("nextBookId"),
+                "title": s.get("nextTitle"),
+                "index": s.get("nextIndex"),
+            }
+        series.append(entry)
+    return {"total": total, "series": series}
+
+
+@mcp.tool(
+    annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Get books in a series"}
+)
+async def get_series_books(
+    series_id: int,
+    sort: Literal["seriesIndex", "title", "addedAt"] = "seriesIndex",
+    order: Literal["asc", "desc"] = "asc",
+    limit: int = 50,
+    offset: int = 0,
+) -> SearchResult:
+    """List the books in a series (in reading order by default) as trimmed
+    summaries. Get series ids from list_series."""
+
+    async def fetch(page: int, size: int) -> dict[str, Any]:
+        return await client.get(
+            f"/api/v1/series/{series_id}/books",
+            params={"page": page, "size": size, "sort": sort, "order": order},
+        )
+
+    limit = max(1, min(limit, 500))
+    cards, total = await _fetch_window(fetch, offset=offset, limit=limit, max_page_size=100)
+    return SearchResult(
+        total=total, limit=limit, offset=offset, books=[_summarize_card(c) for c in cards]
+    )
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "List smart scopes"})
+async def list_smart_scopes() -> list[dict]:
+    """List smart scopes: saved searches whose book list updates itself. Each has an
+    id, name, book count, and its `filter` (a BookOrbit filter group, the same form
+    search_books' `filters.rules` takes). Use get_smart_scope_books for the books."""
+    rows = await client.get("/api/v1/smart-scopes") or []
+    return [
+        {
+            "id": s.get("id"),
+            "name": s.get("name"),
+            "book_count": s.get("bookCount"),
+            "is_public": s.get("isPublic"),
+            "is_owner": s.get("isOwner"),
+            "filter": s.get("filter"),
+        }
+        for s in rows
+        if isinstance(s, dict)
+    ]
+
+
+@mcp.tool(
+    annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Get smart scope books"}
+)
+async def get_smart_scope_books(
+    scope_id: int,
+    sort: str | None = None,
+    order: Literal["asc", "desc"] = "asc",
+    limit: int = 50,
+    offset: int = 0,
+) -> SearchResult:
+    """List the books a smart scope currently matches, as trimmed summaries. Leave
+    `sort` empty for the scope's own default order, or pass any search_books sort
+    field. Get scope ids from list_smart_scopes."""
+    limit = max(1, min(limit, QUERY_PAGE_SIZE_MAX))
+    cards, total = await _books_window(
+        offset=offset,
+        limit=limit,
+        sort=_sort_spec(sort, order) if sort else None,
+        smart_scope_id=scope_id,
+    )
+    return SearchResult(
+        total=total, limit=limit, offset=offset, books=[_summarize_card(c) for c in cards]
+    )
+
+
+LibraryReport = Literal[
+    "summary",
+    "genre-distribution",
+    "language-distribution",
+    "format-distribution",
+    "storage-by-format",
+    "top-authors",
+    "top-series",
+    "publication-decade",
+    "publication-year-timeline",
+    "page-count-distribution",
+    "largest-books",
+    "metadata-completeness",
+    "library-metadata-completeness",
+    "metadata-score-distribution",
+    "metadata-freshness-gauge",
+    "library-integrity-gauge",
+    "books-added-over-time",
+    "format-share-over-time",
+    "genre-cooccurrence",
+]
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Library statistics"})
+async def get_library_statistics(
+    report: LibraryReport = "summary",
+    library_ids: list[int] | None = None,
+    granularity: Literal["monthly", "yearly"] | None = None,
+    range: Literal["last-year", "last-5-years", "all-time"] | None = None,
+) -> dict:
+    """BookOrbit's library statistics, one report per call: summary (totals),
+    distributions (genre, language, format, storage, page count, publication
+    decade/year, metadata score), top authors and series, largest books, metadata
+    completeness and freshness, library integrity, genre co-occurrence, and books
+    added over time (`granularity` monthly/yearly and `range` apply to that one).
+    `library_ids` limits any report to some libraries. Returns {report, data}, with
+    `data` as BookOrbit sends it."""
+    params: dict[str, Any] = {}
+    if library_ids:
+        params["libraryIds"] = list(library_ids)
+    if report == "books-added-over-time":
+        if granularity:
+            params["granularity"] = granularity
+        if range:
+            params["range"] = range
+    elif granularity or range:
+        raise BookOrbitError("granularity and range only apply to books-added-over-time.")
+    data = await client.get(f"/api/v1/statistics/{report}", params=params)
+    return {"report": report, "data": data}
+
+
+# Reading reports that take a `days` window (UserDailyReadingQueryDto).
+_DAYS_REPORTS = frozenset(
+    (
+        "daily-reading",
+        "reading-heatmap",
+        "reading-source-distribution",
+        "peak-hours",
+        "favorite-days",
+        "completion-timeline",
+        "progress-funnel",
+        "completion-latency",
+        "genre-reading-time",
+        "reading-pace",
+        "reading-survival",
+        "completion-race",
+        "session-archetypes",
+        "author-genre-chord",
+    )
+)
+# activity-overview, activity-calendar and activity-details/* exist too, but BookOrbit
+# refuses API keys on them (API_KEY_ROUTE_FORBIDDEN), so they are not offered.
+ReadingReport = Literal[
+    "summary",
+    "daily-reading",
+    "reading-heatmap",
+    "reading-source-distribution",
+    "peak-hours",
+    "favorite-days",
+    "completion-timeline",
+    "progress-funnel",
+    "completion-latency",
+    "genre-reading-time",
+    "reading-pace",
+    "reading-survival",
+    "completion-race",
+    "session-archetypes",
+    "author-genre-chord",
+]
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Reading statistics"})
+async def get_reading_statistics(
+    report: ReadingReport = "summary",
+    days: int | None = None,
+    library_ids: list[int] | None = None,
+) -> dict:
+    """Your reading statistics from BookOrbit's reading sessions, one report per
+    call: summary, and daily reading, heatmap, reading sources, peak hours, favorite
+    days, completion timeline, progress funnel, completion latency, time per genre,
+    pace, survival, completion race, session archetypes and author/genre links.
+    All but summary take a `days` window (1-3650). `library_ids` limits any report
+    to some libraries. Returns {report, data}, with `data` as BookOrbit sends it."""
+    params: dict[str, Any] = {}
+    if library_ids:
+        params["libraryIds"] = list(library_ids)
+    if days is not None:
+        if report not in _DAYS_REPORTS:
+            raise BookOrbitError(f"`days` does not apply to {report}.")
+        if not 1 <= days <= 3650:
+            raise BookOrbitError("days must be between 1 and 3650.")
+        params["days"] = days
+    data = await client.get(f"/api/v1/user-statistics/{report}", params=params)
+    return {"report": report, "data": data}
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Reading history"})
+async def get_reading_history(
+    book_id: int | None = None,
+    year: int | None = None,
+    quarter: int | None = None,
+    outcomes: list[Literal["completed", "skimmed", "abandoned"]] | None = None,
+    search: str = "",
+    sort: Literal["newest", "oldest"] = "newest",
+    limit: int = 50,
+    offset: int = 0,
+    include_summary: bool = True,
+) -> dict:
+    """Your reading history: each read-through (attempt) of a book with its dates,
+    outcome (completed, skimmed, abandoned), read number, sessions, time spent,
+    highlights and rating. Filter by `book_id`, `year` (and `quarter` 1-4),
+    `outcomes`, or a title/author `search`. With `include_summary`, also returns
+    totals for the period (reads, books, rereads, pages, time, records). With a
+    `book_id`, also returns that book's reading-session stats. Returns {total,
+    reads, summary?, sessions?}."""
+    if quarter is not None and year is None:
+        raise BookOrbitError("quarter needs a year.")
+    period: dict[str, Any] = {}
+    if year is not None:
+        period["year"] = year
+    if quarter is not None:
+        period["quarter"] = quarter
+    params: dict[str, Any] = {
+        **period,
+        "sort": sort,
+        "offset": max(0, offset),
+        "limit": max(1, min(limit, 200)),
+    }
+    if book_id is not None:
+        params["bookId"] = book_id
+    if outcomes:
+        params["outcomes"] = list(outcomes)
+    if search:
+        params["search"] = search
+    page = await client.get("/api/v1/reading-history", params=params)
+    result: dict[str, Any] = {"total": page.get("total"), "reads": page.get("items") or []}
+    if include_summary:
+        result["summary"] = await client.get("/api/v1/reading-history/summary", params=period)
+    if book_id is not None:
+        sessions = await client.get(f"/api/v1/books/{book_id}/sessions")
+        result["sessions"] = (sessions or {}).get("stats")
+    return result
+
+
+@mcp.tool(
+    annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Get highlights and notes"}
+)
+async def get_annotations(book_id: int, include_bookmarks: bool = True) -> dict:
+    """Your highlights (with notes) and bookmarks in a book, in reading order where
+    BookOrbit provides it. Returns {highlights:[{id, text, note, chapter, color,
+    highlighted_at, starred}], bookmarks:[...]}."""
+    rows = await client.get(f"/api/v1/books/{book_id}/annotations") or []
+    result: dict[str, Any] = {
+        "highlights": [
+            {
+                "id": a.get("id"),
+                "text": a.get("text"),
+                "note": a.get("note"),
+                "chapter": a.get("chapterTitle"),
+                "color": a.get("color"),
+                "highlighted_at": a.get("highlightedAt") or a.get("createdAt"),
+                "starred": a.get("starredAt") is not None,
+            }
+            for a in rows
+            if isinstance(a, dict)
+        ]
+    }
+    if include_bookmarks:
+        result["bookmarks"] = await client.get(f"/api/v1/books/{book_id}/bookmarks") or []
+    return result
+
+
+# ---- Metadata refresh --------------------------------------------------------
+
+_BULK_REFRESH_PATH = "/api/v1/books/bulk-refresh-metadata"
+# Bulk refresh asks external providers for every book, so it can take a while.
+METADATA_REFRESH_TIMEOUT = 600.0
+REFRESH_PREVIEW_MAX = 10
+
+
+async def _stream_bulk_refresh(body: dict[str, Any], ctx: Context | None) -> dict[str, Any]:
+    """POST a bulk refresh and read its server-sent events to the end: one event per
+    book ({bookId, success, error?}), then {done: true, processed, failed}."""
+    succeeded: list[int] = []
+    failed: list[dict[str, Any]] = []
+    final: dict[str, Any] = {}
+    total = len(body["bookIds"])
+    headers = {**client.auth_headers(), "Accept": "text/event-stream"}
+    try:
+        async with client._http.stream(
+            "POST", _BULK_REFRESH_PATH, json=body, headers=headers, timeout=METADATA_REFRESH_TIMEOUT
+        ) as resp:
+            if resp.status_code >= 400:
+                await resp.aread()
+                raise _api_error("POST", _BULK_REFRESH_PATH, resp)
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                with suppress(json.JSONDecodeError):
+                    event = json.loads(line[len("data:") :].strip())
+                    if not isinstance(event, dict):
+                        continue
+                    if event.get("done"):
+                        final = event
+                    elif event.get("bookId") is not None:
+                        if event.get("success"):
+                            succeeded.append(event["bookId"])
+                        else:
+                            failed.append({"book_id": event["bookId"], "error": event.get("error")})
+                        if ctx is not None:
+                            await ctx.report_progress(
+                                progress=len(succeeded) + len(failed), total=total
+                            )
+    except httpx.TimeoutException as exc:
+        raise BookOrbitError(
+            "The metadata refresh timed out; it may still be running on the server."
+        ) from exc
+    except httpx.TransportError as exc:
+        raise BookOrbitError(f"Could not reach BookOrbit at {client._base_url}: {exc}") from exc
+    return {
+        "refreshed": succeeded,
+        "failed": failed,
+        "processed": final.get("processed", len(succeeded) + len(failed)),
+        "completed": bool(final),
+    }
+
+
+@mcp.tool(annotations={"destructiveHint": True, "openWorldHint": True, "title": "Refresh metadata"})
+async def refresh_metadata(
+    book_ids: list[int],
+    preview: bool = True,
+    ignore_cache: bool = False,
+    ctx: Context | None = None,
+) -> dict:
+    """Re-fetch books' metadata from BookOrbit's metadata providers, following the
+    library's provider and field settings. Locked fields are never overwritten.
+
+    With `preview` (the default) nothing is written: it returns what BookOrbit would
+    set for each book (up to 10 books) and the providers' diagnostics. With
+    preview=False it applies the refresh to every book, overwriting unlocked
+    fields; on libraries with file writing enabled that also rewrites the book
+    files. Lock curated fields with set_field_locks first. `ignore_cache` asks the
+    providers live instead of using BookOrbit's metadata cache. Needs the
+    library_edit_metadata permission. Returns {previews} or {refreshed, failed,
+    processed, completed}.
+    """
+    if not book_ids:
+        raise BookOrbitError("Pass at least one book id.")
+    if preview:
+        if len(book_ids) > REFRESH_PREVIEW_MAX:
+            raise BookOrbitError(
+                f"Preview at most {REFRESH_PREVIEW_MAX} books per call (each asks the providers)."
+            )
+        previews = []
+        for book_id in book_ids:
+            try:
+                previews.append(
+                    {
+                        "book_id": book_id,
+                        **await client.post(
+                            f"/api/v1/books/{book_id}/refresh-metadata", params={"preview": "true"}
+                        ),
+                    }
+                )
+            except BookOrbitError as exc:
+                previews.append({"book_id": book_id, "error": str(exc)})
+        return {"preview": True, "previews": previews}
+    body: dict[str, Any] = {"bookIds": list(book_ids)}
+    if ignore_cache:
+        body["ignoreCache"] = True
+    return {"preview": False, **await _stream_bulk_refresh(body, ctx)}
 
 
 def main() -> None:

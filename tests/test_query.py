@@ -182,7 +182,7 @@ async def test_query_books_routes_by_scope(respx_mock, scope, path):
 
 async def test_query_books_rejects_two_scopes():
     client = BookOrbitClient(BASE, KEY)
-    with pytest.raises(BookOrbitError, match="not both"):
+    with pytest.raises(BookOrbitError, match="not several"):
         await client.query_books({}, library_id=1, collection_id=2)
 
 

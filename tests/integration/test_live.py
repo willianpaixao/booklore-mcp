@@ -146,3 +146,28 @@ async def test_search_missing_filter_matches_direct_query(live_tools):
     )
     await direct_client.close()
     assert result.data.total == direct["total"]
+
+
+@needs_key
+async def test_series_and_smart_scope_counts_match_their_book_lists(live_tools):
+    from fastmcp import Client
+
+    async with Client(server.mcp) as c:
+        series = (await c.call_tool("list_series", {"limit": 1})).data["series"]
+        if series:
+            books = (await c.call_tool("get_series_books", {"series_id": series[0]["id"]})).data
+            assert books.total == series[0]["book_count"]
+        scopes = (await c.call_tool("list_smart_scopes", {})).structured_content["result"]
+        if scopes:
+            books = (await c.call_tool("get_smart_scope_books", {"scope_id": scopes[0]["id"]})).data
+            assert books.total == scopes[0]["book_count"]
+
+
+@needs_key
+async def test_library_statistics_summary_matches_query_total(live_tools):
+    from fastmcp import Client
+
+    async with Client(server.mcp) as c:
+        stats = (await c.call_tool("get_library_statistics", {"report": "summary"})).data
+        search = (await c.call_tool("search_books", {"limit": 1})).data
+    assert stats["data"]["totalBooks"] == search.total
