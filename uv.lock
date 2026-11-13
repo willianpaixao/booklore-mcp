@@ -157,7 +157,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "fastmcp", specifier = ">=3.0" },
+    { name = "fastmcp", specifier = ">=4.1.7,<5" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "structlog", specifier = ">=24.1" },
 ]
